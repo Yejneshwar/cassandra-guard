@@ -1,0 +1,100 @@
+{
+  "keyspace": "ecommerce",
+  "version": "1.0.0",
+  "description": "E-commerce application schema",
+  "replication": {
+    "class": "NetworkTopologyStrategy",
+    "dc1": 3
+  },
+  "durable_writes": true,
+  "types": {
+    "address": {
+      "fields": {
+        "street": "text",
+        "city": "text",
+        "state": "text",
+        "zip": "text",
+        "country": "text"
+      },
+      "description": "Mailing or shipping address"
+    }
+  },
+  "tables": {
+    "users": {
+      "description": "Core user table partitioned by user_id",
+      "columns": {
+        "user_id": "uuid",
+        "email": "text",
+        "name": "text",
+        "address": "frozen<address>",
+        "created_at": "timestamp",
+        "updated_at": "timestamp",
+        "tags": "set<text>",
+        "preferences": "map<text, text>"
+      },
+      "partition_key": ["user_id"],
+      "clustering_key": [],
+      "indexes": [
+        "email",
+        {
+          "name": "idx_users_tags",
+          "column": "tags",
+          "type": "values"
+        }
+      ]
+    },
+    "orders_by_user": {
+      "description": "Orders partitioned by user, clustered by time descending",
+      "columns": {
+        "user_id": "uuid",
+        "order_id": "timeuuid",
+        "status": "text",
+        "total_cents": "bigint",
+        "items": "list<text>",
+        "created_at": "timestamp"
+      },
+      "partition_key": ["user_id"],
+      "clustering_key": [
+        { "column": "order_id", "order": "DESC" }
+      ],
+      "options": {
+        "default_time_to_live": 0,
+        "gc_grace_seconds": 864000
+      }
+    },
+    "orders_by_status": {
+      "description": "Orders partitioned by status for admin queries",
+      "columns": {
+        "status": "text",
+        "order_date": "date",
+        "order_id": "timeuuid",
+        "user_id": "uuid",
+        "total_cents": "bigint"
+      },
+      "partition_key": ["status", "order_date"],
+      "clustering_key": [
+        { "column": "order_id", "order": "DESC" }
+      ]
+    },
+    "products": {
+      "description": "Product catalog",
+      "columns": {
+        "product_id": "uuid",
+        "name": "text",
+        "description": "text",
+        "price_cents": "bigint",
+        "category": "text",
+        "attributes": "map<text, text>",
+        "in_stock": "boolean",
+        "stock_count": {
+          "type": "int",
+          "static": false,
+          "description": "Current stock level"
+        }
+      },
+      "partition_key": ["product_id"],
+      "clustering_key": [],
+      "indexes": ["category"]
+    }
+  }
+}

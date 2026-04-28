@@ -1,0 +1,490 @@
+/**
+ * Integration tests for cassandra-guard against a real Cassandra instance.
+ *
+ * Environment variables:
+ *   CASSANDRA_HOST       — default: 127.0.0.1
+ *   CASSANDRA_PORT       — default: 9042
+ *   CASSANDRA_DATACENTER — default: datacenter1
+ *
+ * If Cassandra is not reachable the entire suite is skipped gracefully.
+ */
+
+const { describe, it, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('path');
+
+const { SchemaRegistry } = require('../src/SchemaRegistry');
+const { CQLBuilder } = require('../src/CQLBuilder');
+const { DDLGenerator } = require('../src/DDLGenerator');
+const { MigrationDiffer } = require('../src/MigrationDiffer');
+const { LiveSchemaIntrospector } = require('../src/LiveSchemaIntrospector');
+
+// ── Connection config ────────────────────────────────────────────────────────
+
+const CONTACT_POINT = process.env.CASSANDRA_HOST || '127.0.0.1';
+const PORT = parseInt(process.env.CASSANDRA_PORT || '9042', 10);
+const LOCAL_DC = process.env.CASSANDRA_DATACENTER || 'datacenter1';
+const TEST_KEYSPACE = 'csg_integration_test';
+
+// ── Test schema (SimpleStrategy RF=1 so it works on a single-node CI cluster) ─
+
+const testSchema = {
+  keyspace: TEST_KEYSPACE,
+  replication: { class: 'SimpleStrategy', replication_factor: 1 },
+  durable_writes: true,
+  types: {
+    address: {
+      fields: {
+        street: 'text',
+        city: 'text',
+        state: 'text',
+        zip: 'text',
+        country: 'text',
+      },
+    },
+  },
+  tables: {
+    users: {
+      columns: {
+        user_id: 'uuid',
+        email: 'text',
+        name: 'text',
+        created_at: 'timestamp',
+        tags: 'set<text>',
+        preferences: 'map<text, text>',
+      },
+      partition_key: ['user_id'],
+      clustering_key: [],
+      indexes: ['email'],
+    },
+    orders_by_user: {
+      columns: {
+        user_id: 'uuid',
+        order_id: 'timeuuid',
+        status: 'text',
+        total_cents: 'bigint',
+        items: 'list<text>',
+        created_at: 'timestamp',
+      },
+      partition_key: ['user_id'],
+      clustering_key: [{ column: 'order_id', order: 'DESC' }],
+      options: {
+        default_time_to_live: 0,
+        gc_grace_seconds: 864000,
+      },
+    },
+    products: {
+      columns: {
+        product_id: 'uuid',
+        name: 'text',
+        description: 'text',
+        price_cents: 'bigint',
+        category: 'text',
+        in_stock: 'boolean',
+      },
+      partition_key: ['product_id'],
+      clustering_key: [],
+      indexes: ['category'],
+    },
+  },
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+let client;
+let cassandra;
+
+async function connectOrSkip() {
+  try {
+    cassandra = require('cassandra-driver');
+  } catch {
+    return null;
+  }
+
+  const c = new cassandra.Client({
+    contactPoints: [CONTACT_POINT],
+    localDataCenter: LOCAL_DC,
+    protocolOptions: { port: PORT },
+    socketOptions: { connectTimeout: 5000, readTimeout: 12000 },
+  });
+
+  try {
+    await c.connect();
+    return c;
+  } catch {
+    return null;
+  }
+}
+
+async function dropTestKeyspace() {
+  try {
+    await client.execute(`DROP KEYSPACE IF EXISTS ${TEST_KEYSPACE}`);
+  } catch {
+    // best-effort
+  }
+}
+
+/**
+ * Guard that skips the test if Cassandra is not connected.
+ * Call at the top of every `it()` callback: `if (skipIfNoDb(t)) return;`
+ */
+function skipIfNoDb(t) {
+  if (!client) {
+    t.skip('Cassandra not reachable');
+    return true;
+  }
+  return false;
+}
+
+// ── Suite ────────────────────────────────────────────────────────────────────
+
+describe('Integration — real Cassandra', { timeout: 120_000 }, () => {
+  let registry;
+  let cql;
+  let ddlGen;
+  let userId;
+
+  before(async () => {
+    client = await connectOrSkip();
+    if (!client) {
+      console.log('Cassandra not reachable — skipping integration tests');
+      return;
+    }
+    // Start clean
+    await dropTestKeyspace();
+
+    // Generate a UUID for CRUD tests (must happen after cassandra-driver is loaded)
+    userId = cassandra.types.Uuid.random();
+
+    // Register schema
+    registry = new SchemaRegistry();
+    registry.register(testSchema);
+    cql = new CQLBuilder(registry);
+    ddlGen = new DDLGenerator(registry);
+  });
+
+  after(async () => {
+    if (client) {
+      await dropTestKeyspace();
+      await client.shutdown();
+    }
+  });
+
+  // ── DDL Execution ────────────────────────────────────────────────────────
+
+  describe('DDL Execution', () => {
+    it('creates keyspace, types, and tables from generated DDL', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const statements = ddlGen.generateKeyspace(TEST_KEYSPACE);
+      assert.ok(statements.length > 0, 'DDL should produce statements');
+
+      for (const stmt of statements) {
+        await client.execute(stmt);
+      }
+
+      // Verify keyspace exists
+      const ksResult = await client.execute(
+        'SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = ?',
+        [TEST_KEYSPACE],
+        { prepare: true }
+      );
+      assert.equal(ksResult.rows.length, 1, 'Keyspace should exist');
+
+      // Verify tables exist
+      const tableResult = await client.execute(
+        'SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?',
+        [TEST_KEYSPACE],
+        { prepare: true }
+      );
+      const tableNames = tableResult.rows.map(r => r.table_name).sort();
+      assert.deepEqual(tableNames, ['orders_by_user', 'products', 'users']);
+
+      // Verify UDT exists
+      const udtResult = await client.execute(
+        'SELECT type_name FROM system_schema.types WHERE keyspace_name = ?',
+        [TEST_KEYSPACE],
+        { prepare: true }
+      );
+      assert.equal(udtResult.rows.length, 1);
+      assert.equal(udtResult.rows[0].type_name, 'address');
+    });
+  });
+
+  // ── CQL Builder CRUD ──────────────────────────────────────────────────────
+
+  describe('CQL Builder CRUD', () => {
+    it('INSERTs a row via CQLBuilder', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const { cql: insertCql, params } = cql.insert(TEST_KEYSPACE, 'users')
+        .values({
+          user_id: userId,
+          email: 'integration@test.com',
+          name: 'Integration User',
+          tags: ['beta', 'tester'],
+          preferences: { theme: 'dark' },
+        })
+        .build();
+
+      await client.execute(insertCql, params, { prepare: true });
+
+      // Verify the row
+      const result = await client.execute(
+        `SELECT * FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [userId],
+        { prepare: true }
+      );
+      assert.equal(result.rows.length, 1);
+      assert.equal(result.rows[0].email, 'integration@test.com');
+      assert.equal(result.rows[0].name, 'Integration User');
+    });
+
+    it('SELECTs the inserted row via CQLBuilder', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const { cql: selectCql, params } = cql.select(TEST_KEYSPACE, 'users')
+        .columns('user_id', 'email', 'name')
+        .where('user_id', userId)
+        .build();
+
+      const result = await client.execute(selectCql, params, { prepare: true });
+      assert.equal(result.rows.length, 1);
+      assert.equal(result.rows[0].email, 'integration@test.com');
+    });
+
+    it('UPDATEs a row via CQLBuilder', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const { cql: updateCql, params } = cql.update(TEST_KEYSPACE, 'users')
+        .set('name', 'Updated User')
+        .where('user_id', userId)
+        .build();
+
+      await client.execute(updateCql, params, { prepare: true });
+
+      const result = await client.execute(
+        `SELECT name FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [userId],
+        { prepare: true }
+      );
+      assert.equal(result.rows[0].name, 'Updated User');
+    });
+
+    it('UPDATEs a set collection via addToSet', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const { cql: updateCql, params } = cql.update(TEST_KEYSPACE, 'users')
+        .addToSet('tags', ['premium'])
+        .where('user_id', userId)
+        .build();
+
+      await client.execute(updateCql, params, { prepare: true });
+
+      const result = await client.execute(
+        `SELECT tags FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [userId],
+        { prepare: true }
+      );
+      const tags = result.rows[0].tags;
+      // cassandra-driver returns sets as arrays
+      assert.ok(Array.isArray(tags) ? tags.includes('beta') : tags.has('beta'));
+      assert.ok(Array.isArray(tags) ? tags.includes('tester') : tags.has('tester'));
+      assert.ok(Array.isArray(tags) ? tags.includes('premium') : tags.has('premium'));
+    });
+
+    it('UPDATEs a map collection via putToMap', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const { cql: updateCql, params } = cql.update(TEST_KEYSPACE, 'users')
+        .putToMap('preferences', 'lang', 'en')
+        .where('user_id', userId)
+        .build();
+
+      await client.execute(updateCql, params, { prepare: true });
+
+      const result = await client.execute(
+        `SELECT preferences FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [userId],
+        { prepare: true }
+      );
+      const prefs = result.rows[0].preferences;
+      // cassandra-driver returns maps as plain objects
+      assert.equal(prefs.theme || prefs.get?.('theme'), 'dark');
+      assert.equal(prefs.lang || prefs.get?.('lang'), 'en');
+    });
+
+    it('DELETEs a row via CQLBuilder', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const { cql: deleteCql, params } = cql.delete(TEST_KEYSPACE, 'users')
+        .where('user_id', userId)
+        .build();
+
+      await client.execute(deleteCql, params, { prepare: true });
+
+      const result = await client.execute(
+        `SELECT * FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [userId],
+        { prepare: true }
+      );
+      assert.equal(result.rows.length, 0);
+    });
+  });
+
+  // ── Batch Operations ───────────────────────────────────────────────────────
+
+  describe('Batch Operations', () => {
+    it('executes a batched insert of multiple products', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const ids = Array.from({ length: 3 }, () => cassandra.types.Uuid.random());
+
+      const batch = cql.batch('LOGGED');
+      for (let i = 0; i < ids.length; i++) {
+        batch.add(
+          cql.insert(TEST_KEYSPACE, 'products').values({
+            product_id: ids[i],
+            name: `Product ${i}`,
+            description: `Description ${i}`,
+            price_cents: (i + 1) * 1000,
+            category: 'test-category',
+            in_stock: true,
+          })
+        );
+      }
+
+      const { cql: batchCql, params } = batch.build();
+      await client.execute(batchCql, params, { prepare: true });
+
+      // Verify all rows
+      for (const id of ids) {
+        const result = await client.execute(
+          `SELECT * FROM ${TEST_KEYSPACE}.products WHERE product_id = ?`,
+          [id],
+          { prepare: true }
+        );
+        assert.equal(result.rows.length, 1);
+      }
+    });
+  });
+
+  // ── LiveSchemaIntrospector ─────────────────────────────────────────────────
+
+  describe('LiveSchemaIntrospector', () => {
+    it('introspects the keyspace and returns a valid schema', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      assert.equal(liveSchema.keyspace, TEST_KEYSPACE);
+
+      // Should have all our tables
+      const liveTableNames = Object.keys(liveSchema.tables).sort();
+      assert.deepEqual(liveTableNames, ['orders_by_user', 'products', 'users']);
+
+      // Verify users table columns exist
+      const usersCols = Object.keys(liveSchema.tables.users.columns).sort();
+      assert.ok(usersCols.includes('user_id'));
+      assert.ok(usersCols.includes('email'));
+      assert.ok(usersCols.includes('name'));
+      assert.ok(usersCols.includes('tags'));
+      assert.ok(usersCols.includes('preferences'));
+
+      // Verify partition key
+      assert.deepEqual(liveSchema.tables.users.partition_key, ['user_id']);
+
+      // Verify clustering key on orders_by_user
+      const ordersCK = liveSchema.tables.orders_by_user.clustering_key;
+      assert.equal(ordersCK.length, 1);
+      assert.equal(ordersCK[0].column, 'order_id');
+      assert.equal(ordersCK[0].order, 'DESC');
+
+      // Verify UDT
+      assert.ok(liveSchema.types.address);
+      assert.ok(liveSchema.types.address.fields.street);
+    });
+
+    it('throws on a nonexistent keyspace', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      await assert.rejects(
+        () => introspector.introspect('totally_fake_keyspace_xyz'),
+        /does not exist/
+      );
+    });
+  });
+
+  // ── Migration Differ round-trip ────────────────────────────────────────────
+
+  describe('Migration Differ round-trip', () => {
+    it('diffs live schema vs. modified schema and applies migration', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      // Build a "new" schema that adds a column to `users` and a new table
+      const newSchema = JSON.parse(JSON.stringify(testSchema));
+      newSchema.tables.users.columns.phone = 'text';
+      newSchema.tables.audit_log = {
+        columns: {
+          event_id: 'uuid',
+          event_type: 'text',
+          payload: 'text',
+          created_at: 'timestamp',
+        },
+        partition_key: ['event_id'],
+        clustering_key: [],
+      };
+
+      // Register and normalize the new schema
+      const newRegistry = new SchemaRegistry();
+      newRegistry.register(newSchema);
+      const normalizedNew = newRegistry.get(TEST_KEYSPACE);
+
+      // Diff
+      const differ = new MigrationDiffer();
+      const result = differ.diff(liveSchema, normalizedNew);
+
+      assert.ok(result.statements.length > 0, 'Should have migration statements');
+
+      // Should include ALTER TABLE ... ADD phone and CREATE TABLE ... audit_log
+      const hasAddPhone = result.statements.some(s =>
+        s.includes('ADD phone') && s.includes('users')
+      );
+      const hasCreateAudit = result.statements.some(s =>
+        s.includes('CREATE TABLE') && s.includes('audit_log')
+      );
+      assert.ok(hasAddPhone, 'Migration should add phone column');
+      assert.ok(hasCreateAudit, 'Migration should create audit_log table');
+
+      // Apply migration
+      for (const stmt of result.statements) {
+        await client.execute(stmt);
+      }
+
+      // Re-introspect and verify
+      const updatedSchema = await introspector.introspect(TEST_KEYSPACE);
+      assert.ok('phone' in updatedSchema.tables.users.columns, 'phone column should exist after migration');
+      assert.ok('audit_log' in updatedSchema.tables, 'audit_log table should exist after migration');
+
+      // Diff again — should be in sync now
+      const newRegistry2 = new SchemaRegistry();
+      newRegistry2.register(newSchema);
+      const normalizedNew2 = newRegistry2.get(TEST_KEYSPACE);
+      const result2 = differ.diff(updatedSchema, normalizedNew2);
+      // Filter out index-related and table-option statements since introspection may
+      // return indexes in a different format and omit default option values (e.g.
+      // default_time_to_live = 0 is not returned by Cassandra since it's the default)
+      const nonTrivialStmts = result2.statements.filter(s =>
+        !s.includes('CREATE INDEX') &&
+        !s.includes('DROP INDEX') &&
+        !s.includes('default_time_to_live = 0')
+      );
+      assert.equal(nonTrivialStmts.length, 0, 'Schema should be in sync after applying migration (ignoring index/option format diffs)');
+    });
+  });
+});

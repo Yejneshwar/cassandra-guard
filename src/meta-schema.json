@@ -1,0 +1,192 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Cassandra Keyspace Schema",
+  "type": "object",
+  "required": ["keyspace", "tables"],
+  "additionalProperties": false,
+  "properties": {
+    "keyspace": { "type": "string", "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$" },
+    "replication": {
+      "type": "object",
+      "required": ["class"],
+      "properties": {
+        "class": {
+          "type": "string",
+          "enum": ["SimpleStrategy", "NetworkTopologyStrategy"]
+        },
+        "replication_factor": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": { "type": "integer", "minimum": 1 }
+    },
+    "durable_writes": { "type": "boolean", "default": true },
+    "tables": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-zA-Z_][a-zA-Z0-9_]*$": { "$ref": "#/definitions/table" }
+      },
+      "additionalProperties": false
+    },
+    "types": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-zA-Z_][a-zA-Z0-9_]*$": { "$ref": "#/definitions/udt" }
+      },
+      "additionalProperties": false
+    },
+    "version": { "type": "string" },
+    "description": { "type": "string" }
+  },
+  "definitions": {
+    "cassandra_type": {
+      "type": "string",
+      "pattern": "^(ascii|bigint|blob|boolean|counter|date|decimal|double|duration|float|inet|int|smallint|text|time|timestamp|timeuuid|tinyint|uuid|varchar|varint|frozen<.+>|list<.+>|set<.+>|map<.+,.+>|tuple<.+>|[a-zA-Z_][a-zA-Z0-9_]*)$"
+    },
+    "column_def": {
+      "oneOf": [
+        { "$ref": "#/definitions/cassandra_type" },
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "$ref": "#/definitions/cassandra_type" },
+            "static": { "type": "boolean", "default": false },
+            "description": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "table": {
+      "type": "object",
+      "required": ["columns", "partition_key"],
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "type": "object",
+          "patternProperties": {
+            "^[a-zA-Z_][a-zA-Z0-9_]*$": { "$ref": "#/definitions/column_def" }
+          },
+          "additionalProperties": false
+        },
+        "partition_key": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "clustering_key": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "required": ["column", "order"],
+                "properties": {
+                  "column": { "type": "string" },
+                  "order": { "type": "string", "enum": ["ASC", "DESC"] }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "indexes": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "required": ["column"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "column": { "type": "string" },
+                  "type": { "type": "string", "enum": ["values", "keys", "entries", "full"] },
+                  "using": { "type": "string" }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "materialized_views": {
+          "type": "object",
+          "patternProperties": {
+            "^[a-zA-Z_][a-zA-Z0-9_]*$": { "$ref": "#/definitions/materialized_view" }
+          },
+          "additionalProperties": false
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "clustering_order": { "type": "object" },
+            "compaction": { "type": "object" },
+            "compression": { "type": "object" },
+            "default_time_to_live": { "type": "integer", "minimum": 0 },
+            "gc_grace_seconds": { "type": "integer", "minimum": 0 },
+            "bloom_filter_fp_chance": { "type": "number" },
+            "caching": { "type": "object" },
+            "comment": { "type": "string" },
+            "cdc": { "type": "boolean" }
+          },
+          "additionalProperties": true
+        },
+        "description": { "type": "string" }
+      }
+    },
+    "materialized_view": {
+      "type": "object",
+      "required": ["select", "partition_key", "where"],
+      "additionalProperties": false,
+      "properties": {
+        "select": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "partition_key": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "clustering_key": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "required": ["column", "order"],
+                "properties": {
+                  "column": { "type": "string" },
+                  "order": { "type": "string", "enum": ["ASC", "DESC"] }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        },
+        "where": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        }
+      }
+    },
+    "udt": {
+      "type": "object",
+      "required": ["fields"],
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "type": "object",
+          "patternProperties": {
+            "^[a-zA-Z_][a-zA-Z0-9_]*$": { "$ref": "#/definitions/cassandra_type" }
+          },
+          "additionalProperties": false
+        },
+        "description": { "type": "string" }
+      }
+    }
+  }
+}
