@@ -2,7 +2,7 @@ const { describe, it, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 const { SchemaRegistry } = require('../src/SchemaRegistry');
-const { CQLBuilder, CQLBuildError } = require('../src/CQLBuilder');
+const { CQLBuilder, CQLBuildError, CQLFunction } = require('../src/CQLBuilder');
 
 describe('CQLBuilder', () => {
   let registry;
@@ -468,6 +468,315 @@ describe('CQLBuilder', () => {
         "INSERT INTO ecommerce.users (user_id, fake) VALUES ('uid', 'val')"
       );
       assert.ok(!r.valid);
+    });
+  });
+
+  // ── TTL = 0 ──
+
+  describe('TTL=0 support', () => {
+    it('INSERT accepts ttl(0) and produces USING TTL 0', () => {
+      const q = cql.insert('ecommerce', 'users')
+        .values({ user_id: 'uid-1', email: 'a@b.com' })
+        .ttl(0)
+        .build();
+      assert.match(q.cql, /USING TTL 0/);
+    });
+
+    it('UPDATE accepts ttl(0) and produces USING TTL 0', () => {
+      const q = cql.update('ecommerce', 'users')
+        .set('email', 'new@e.com')
+        .where('user_id', 'uid-1')
+        .ttl(0)
+        .build();
+      assert.match(q.cql, /USING TTL 0/);
+    });
+
+    it('INSERT still rejects negative TTL', () => {
+      assert.throws(
+        () => cql.insert('ecommerce', 'users').values({ user_id: 'uid-1' }).ttl(-1),
+        /non-negative/
+      );
+    });
+
+    it('UPDATE still rejects negative TTL', () => {
+      assert.throws(
+        () => cql.update('ecommerce', 'users').set('email', 'x').where('user_id', 'uid-1').ttl(-5),
+        /non-negative/
+      );
+    });
+
+    it('still rejects non-integer TTL', () => {
+      assert.throws(
+        () => cql.insert('ecommerce', 'users').values({ user_id: 'uid-1' }).ttl(3.5),
+        /non-negative integer/
+      );
+    });
+
+    it('positive TTL still works normally', () => {
+      const q = cql.insert('ecommerce', 'users')
+        .values({ user_id: 'uid-1', email: 'a@b.com' })
+        .ttl(3600)
+        .build();
+      assert.match(q.cql, /USING TTL 3600/);
+    });
+  });
+
+  // ── UDT subfield updates ──
+
+  describe('UDT setField', () => {
+    // The ecommerce schema has frozen<address> — setField must reject it.
+    // For success-path tests, we need a non-frozen UDT column.
+    let nfRegistry, nfCql;
+    beforeEach(() => {
+      nfRegistry = new SchemaRegistry();
+      nfRegistry.register({
+        keyspace: 'test_nf',
+        replication: { class: 'SimpleStrategy', replication_factor: 1 },
+        types: {
+          contact_info: {
+            fields: { phone: 'text', city: 'text', zip: 'text' },
+          },
+        },
+        tables: {
+          accounts: {
+            columns: {
+              account_id: 'uuid',
+              email: 'text',
+              contact: 'contact_info',
+            },
+            partition_key: ['account_id'],
+          },
+        },
+      });
+      nfCql = new CQLBuilder(nfRegistry);
+    });
+
+    it('builds SET contact.city = ? for non-frozen UDT', () => {
+      const q = nfCql.update('test_nf', 'accounts')
+        .setField('contact', 'city', 'NYC')
+        .where('account_id', 'uid-1')
+        .build();
+      assert.match(q.cql, /SET contact\.city = \?/);
+      assert.deepEqual(q.params, ['NYC', 'uid-1']);
+    });
+
+    it('builds SET with multiple UDT subfields', () => {
+      const q = nfCql.update('test_nf', 'accounts')
+        .setField('contact', 'city', 'NYC')
+        .setField('contact', 'zip', '10001')
+        .where('account_id', 'uid-1')
+        .build();
+      assert.match(q.cql, /SET contact\.city = \?, contact\.zip = \?/);
+      assert.deepEqual(q.params, ['NYC', '10001', 'uid-1']);
+    });
+
+    it('can mix setField with regular set', () => {
+      const q = nfCql.update('test_nf', 'accounts')
+        .set('email', 'new@e.com')
+        .setField('contact', 'phone', '555-1234')
+        .where('account_id', 'uid-1')
+        .build();
+      assert.match(q.cql, /SET email = \?, contact\.phone = \?/);
+      assert.deepEqual(q.params, ['new@e.com', '555-1234', 'uid-1']);
+    });
+
+    it('rejects setField on frozen UDT column', () => {
+      // ecommerce.users.address is frozen<address>
+      assert.throws(
+        () => cql.update('ecommerce', 'users')
+          .setField('address', 'city', 'NYC'),
+        /frozen UDT/
+      );
+    });
+
+    it('rejects invalid UDT field name', () => {
+      assert.throws(
+        () => nfCql.update('test_nf', 'accounts')
+          .setField('contact', 'nonexistent_field', 'val'),
+        /not found in UDT/
+      );
+    });
+
+    it('rejects setField on non-UDT column', () => {
+      assert.throws(
+        () => nfCql.update('test_nf', 'accounts')
+          .setField('email', 'something', 'val'),
+        /not found in keyspace/
+      );
+    });
+
+    it('rejects setField on non-existent column', () => {
+      assert.throws(
+        () => cql.update('ecommerce', 'users')
+          .setField('ghost_column', 'field', 'val'),
+        /does not exist/
+      );
+    });
+  });
+
+  // ── CQLFunction (whitelisted server-side functions) ──
+
+  describe('CQLFunction', () => {
+    describe('whitelist validation', () => {
+      it('accepts known function: now', () => {
+        const fn = CQLBuilder.fn('now');
+        assert.ok(fn instanceof CQLFunction);
+      });
+
+      it('accepts known function: uuid', () => {
+        assert.ok(CQLBuilder.fn('uuid') instanceof CQLFunction);
+      });
+
+      it('accepts known function: toTimestamp', () => {
+        assert.ok(CQLBuilder.fn('toTimestamp', CQLBuilder.fn('now')) instanceof CQLFunction);
+      });
+
+      it('rejects unknown function names', () => {
+        assert.throws(() => CQLBuilder.fn('DROP'), CQLBuildError);
+        assert.throws(() => CQLBuilder.fn('DELETE'), CQLBuildError);
+        assert.throws(() => CQLBuilder.fn('eval'), CQLBuildError);
+      });
+
+      it('rejects empty function name', () => {
+        assert.throws(() => CQLBuilder.fn(''), CQLBuildError);
+        assert.throws(() => CQLBuilder.fn('  '), CQLBuildError);
+      });
+
+      it('rejects non-string function name', () => {
+        assert.throws(() => CQLBuilder.fn(123), CQLBuildError);
+        assert.throws(() => CQLBuilder.fn(null), CQLBuildError);
+      });
+
+      it('rejects SQL injection attempts via function name', () => {
+        assert.throws(() => CQLBuilder.fn('now(); DROP TABLE users; --'), CQLBuildError);
+        assert.throws(() => CQLBuilder.fn('toTimestamp(now())'), CQLBuildError);
+        assert.throws(() => CQLBuilder.fn("'); DROP KEYSPACE test; --"), CQLBuildError);
+      });
+    });
+
+    describe('CQL rendering', () => {
+      it('renders now() with no args and no params', () => {
+        const fn = CQLBuilder.fn('now');
+        const params = [];
+        assert.equal(fn.toCQL(params), 'now()');
+        assert.deepEqual(params, []);
+      });
+
+      it('renders toTimestamp(now()) via nesting', () => {
+        const fn = CQLBuilder.fn('toTimestamp', CQLBuilder.fn('now'));
+        const params = [];
+        assert.equal(fn.toCQL(params), 'toTimestamp(now())');
+        assert.deepEqual(params, []);
+      });
+
+      it('parameterizes primitive args as ?', () => {
+        const fn = CQLBuilder.fn('minTimeuuid', '2024-01-01');
+        const params = [];
+        assert.equal(fn.toCQL(params), 'minTimeuuid(?)');
+        assert.deepEqual(params, ['2024-01-01']);
+      });
+
+      it('renders token() with mixed args', () => {
+        const fn = CQLBuilder.fn('token', 'partition_val');
+        const params = [];
+        assert.equal(fn.toCQL(params), 'token(?)');
+        assert.deepEqual(params, ['partition_val']);
+      });
+    });
+
+    describe('in INSERT values', () => {
+      it('uses now() in INSERT without adding to params', () => {
+        const q = cql.insert('ecommerce', 'orders_by_user')
+          .values({
+            user_id: 'uid-1',
+            order_id: CQLBuilder.fn('now'),
+            status: 'pending',
+            total_cents: 999,
+            created_at: CQLBuilder.fn('toTimestamp', CQLBuilder.fn('now')),
+          })
+          .build();
+        assert.match(q.cql, /VALUES \(\?, now\(\), \?, \?, toTimestamp\(now\(\)\)\)/);
+        assert.deepEqual(q.params, ['uid-1', 'pending', 999]);
+      });
+
+      it('uses uuid() in INSERT', () => {
+        const q = cql.insert('ecommerce', 'users')
+          .values({
+            user_id: CQLBuilder.fn('uuid'),
+            email: 'a@b.com',
+          })
+          .build();
+        assert.match(q.cql, /VALUES \(uuid\(\), \?\)/);
+        assert.deepEqual(q.params, ['a@b.com']);
+      });
+
+      it('mixes function and regular values correctly', () => {
+        const q = cql.insert('ecommerce', 'users')
+          .values({
+            user_id: 'uid-1',
+            email: 'a@b.com',
+            created_at: CQLBuilder.fn('currentTimestamp'),
+          })
+          .build();
+        assert.match(q.cql, /\?, \?, currentTimestamp\(\)/);
+        assert.deepEqual(q.params, ['uid-1', 'a@b.com']);
+      });
+    });
+
+    describe('in UPDATE SET', () => {
+      it('uses currentTimestamp() in UPDATE SET', () => {
+        const q = cql.update('ecommerce', 'users')
+          .set('updated_at', CQLBuilder.fn('currentTimestamp'))
+          .where('user_id', 'uid-1')
+          .build();
+        assert.match(q.cql, /SET updated_at = currentTimestamp\(\)/);
+        assert.deepEqual(q.params, ['uid-1']);
+      });
+
+      it('mixes function and regular SET values', () => {
+        const q = cql.update('ecommerce', 'users')
+          .set('email', 'new@e.com')
+          .set('updated_at', CQLBuilder.fn('toTimestamp', CQLBuilder.fn('now')))
+          .where('user_id', 'uid-1')
+          .build();
+        assert.match(q.cql, /SET email = \?, updated_at = toTimestamp\(now\(\)\)/);
+        assert.deepEqual(q.params, ['new@e.com', 'uid-1']);
+      });
+    });
+
+    describe('with parameterized function arguments', () => {
+      it('parameterizes primitive args inside a function in SET', () => {
+        const q = cql.update('ecommerce', 'users')
+          .set('created_at', CQLBuilder.fn('toTimestamp', CQLBuilder.fn('minTimeuuid', '2024-01-01')))
+          .where('user_id', 'uid-1')
+          .build();
+        assert.match(q.cql, /SET created_at = toTimestamp\(minTimeuuid\(\?\)\)/);
+        assert.deepEqual(q.params, ['2024-01-01', 'uid-1']);
+      });
+    });
+
+    describe('security edge cases', () => {
+      it('cannot inject CQL via primitive argument values', () => {
+        // Primitive args become parameterized ?, so injection strings are just data
+        const fn = CQLBuilder.fn('minTimeuuid', "'; DROP TABLE users; --");
+        const params = [];
+        const result = fn.toCQL(params);
+        assert.equal(result, 'minTimeuuid(?)');
+        assert.deepEqual(params, ["'; DROP TABLE users; --"]);
+      });
+
+      it('function names cannot contain special characters', () => {
+        assert.throws(() => CQLBuilder.fn('now()'), CQLBuildError);
+        assert.throws(() => CQLBuilder.fn('a.b'), CQLBuildError);
+        assert.throws(() => CQLBuilder.fn('fn; DROP'), CQLBuildError);
+      });
+
+      it('cannot nest unknown functions inside known functions', () => {
+        assert.throws(
+          () => CQLBuilder.fn('toTimestamp', CQLBuilder.fn('evil')),
+          CQLBuildError
+        );
+      });
     });
   });
 });

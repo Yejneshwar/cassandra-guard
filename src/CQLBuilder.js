@@ -7,6 +7,67 @@ class CQLBuildError extends Error {
   }
 }
 
+// ─── Whitelisted Cassandra server-side functions ─────────────────────────────
+
+const ALLOWED_CQL_FUNCTIONS = new Set([
+  // Time/UUID generators
+  'now', 'uuid', 'currentTimestamp', 'currentDate', 'currentTime', 'currentTimeUUID',
+  // Type conversions
+  'toTimestamp', 'toDate', 'toUnixTimestamp',
+  // TimeUUID bounds
+  'minTimeuuid', 'maxTimeuuid',
+  // Token
+  'token',
+  // Blob conversions
+  'bigintAsBlob', 'blobAsBigint', 'booleanAsBlob', 'blobAsBoolean',
+  'decimalAsBlob', 'blobAsDecimal', 'doubleAsBlob', 'blobAsDouble',
+  'floatAsBlob', 'blobAsFloat', 'inetAsBlob', 'blobAsInet',
+  'intAsBlob', 'blobAsInt', 'textAsBlob', 'blobAsText',
+  'timestampAsBlob', 'blobAsTimestamp', 'timeuuidAsBlob', 'blobAsTimeuuid',
+  'uuidAsBlob', 'blobAsUuid', 'varintAsBlob', 'blobAsVarint',
+  // Aggregates (SELECT-only in practice, but safe to whitelist)
+  'count', 'min', 'max', 'sum', 'avg',
+  // Metadata functions (SELECT-only)
+  'writetime', 'ttl',
+]);
+
+class CQLFunction {
+  /**
+   * Represents a validated Cassandra server-side function call.
+   * @param {string} name - Function name (must be in the whitelist)
+   * @param {...(CQLFunction|*)} args - Arguments: CQLFunction for nesting, anything else gets parameterized
+   */
+  constructor(name, ...args) {
+    if (typeof name !== 'string' || name.trim() === '') {
+      throw new CQLBuildError('CQL function name must be a non-empty string');
+    }
+    if (!ALLOWED_CQL_FUNCTIONS.has(name)) {
+      throw new CQLBuildError(
+        `Unknown CQL function "${name}". Allowed functions: [${[...ALLOWED_CQL_FUNCTIONS].sort().join(', ')}]`
+      );
+    }
+    this._name = name;
+    this._args = args;
+  }
+
+  /**
+   * Render this function call into a CQL fragment, pushing any
+   * parameterized argument values into the provided params array.
+   * @param {Array} params - Mutable array; primitive args are pushed here as ?-bound values
+   * @returns {string} CQL fragment, e.g. "toTimestamp(now())" or "minTimeuuid(?)"
+   */
+  toCQL(params) {
+    const argParts = this._args.map(arg => {
+      if (arg instanceof CQLFunction) {
+        return arg.toCQL(params);
+      }
+      params.push(arg);
+      return '?';
+    });
+    return `${this._name}(${argParts.join(', ')})`;
+  }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function escapeIdentifier(name) {
@@ -230,8 +291,8 @@ class InsertBuilder {
 
   ttl(seconds) {
     guardSealed(this, 'ttl');
-    if (!Number.isInteger(seconds) || seconds <= 0) {
-      throw new CQLBuildError(`TTL must be a positive integer, got: ${seconds}`);
+    if (!Number.isInteger(seconds) || seconds < 0) {
+      throw new CQLBuildError(`TTL must be a non-negative integer, got: ${seconds}`);
     }
     this._ttl = seconds;
     return this;
@@ -270,8 +331,17 @@ class InsertBuilder {
     }
 
     const cols = Object.keys(this._values);
-    const placeholders = cols.map(() => '?');
-    const params = cols.map(c => this._values[c]);
+    const placeholders = [];
+    const params = [];
+    for (const c of cols) {
+      const val = this._values[c];
+      if (val instanceof CQLFunction) {
+        placeholders.push(val.toCQL(params));
+      } else {
+        placeholders.push('?');
+        params.push(val);
+      }
+    }
 
     let cql = `INSERT INTO ${escapeIdentifier(this._keyspace)}.${escapeIdentifier(this._table)} (${cols.map(escapeIdentifier).join(', ')}) VALUES (${placeholders.join(', ')})`;
 
@@ -323,6 +393,15 @@ class UpdateBuilder {
     this._validateColumn(column);
     this._validateNotPrimaryKeyColumn(column);
     this._sets.push({ type: 'set', column, value });
+    return this;
+  }
+
+  setField(column, field, value) {
+    guardSealed(this, 'setField');
+    this._validateColumn(column);
+    this._registry.resolveColumnUDT(this._keyspace, this._table, column, field);
+    this._validateNotPrimaryKeyColumn(column);
+    this._sets.push({ type: 'set_field', column, field, value });
     return this;
   }
 
@@ -423,8 +502,8 @@ class UpdateBuilder {
 
   ttl(seconds) {
     guardSealed(this, 'ttl');
-    if (!Number.isInteger(seconds) || seconds <= 0) {
-      throw new CQLBuildError(`TTL must be a positive integer, got: ${seconds}`);
+    if (!Number.isInteger(seconds) || seconds < 0) {
+      throw new CQLBuildError(`TTL must be a non-negative integer, got: ${seconds}`);
     }
     this._ttl = seconds;
     return this;
@@ -474,8 +553,20 @@ class UpdateBuilder {
       const col = escapeIdentifier(s.column);
       switch (s.type) {
         case 'set':
-          setParts.push(`${col} = ?`);
-          params.push(s.value);
+          if (s.value instanceof CQLFunction) {
+            setParts.push(`${col} = ${s.value.toCQL(params)}`);
+          } else {
+            setParts.push(`${col} = ?`);
+            params.push(s.value);
+          }
+          break;
+        case 'set_field':
+          if (s.value instanceof CQLFunction) {
+            setParts.push(`${escapeIdentifier(s.column)}.${escapeIdentifier(s.field)} = ${s.value.toCQL(params)}`);
+          } else {
+            setParts.push(`${escapeIdentifier(s.column)}.${escapeIdentifier(s.field)} = ?`);
+            params.push(s.value);
+          }
           break;
         case 'increment':
           setParts.push(`${col} = ${col} + ?`);
@@ -777,6 +868,10 @@ class CQLBuilder {
     return new BatchBuilder(type);
   }
 
+  static fn(name, ...args) {
+    return new CQLFunction(name, ...args);
+  }
+
   validateRawCQL(cql) {
     const errors = [];
     const trimmed = cql.trim().replace(/;$/, '');
@@ -898,4 +993,4 @@ class CQLBuilder {
   }
 }
 
-module.exports = { CQLBuilder, CQLBuildError };
+module.exports = { CQLBuilder, CQLBuildError, CQLFunction, ALLOWED_CQL_FUNCTIONS };

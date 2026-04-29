@@ -160,6 +160,50 @@ class SchemaRegistry {
     return [...pk, ...ck];
   }
 
+  /**
+   * Get the field definitions for a UDT by name.
+   * Returns an object mapping field names to their types.
+   */
+  getUDTFields(keyspace, typeName) {
+    const schema = this.get(keyspace);
+    const udt = (schema.types || {})[typeName];
+    if (!udt) {
+      throw new Error(
+        `UDT "${typeName}" not found in keyspace "${keyspace}". Available types: [${Object.keys(schema.types || {}).join(', ')}]`
+      );
+    }
+    return udt.fields;
+  }
+
+  /**
+   * Resolve a column to its UDT type and validate a subfield exists.
+   * Handles both bare UDT names and frozen<udt_name> column types.
+   * Rejects frozen UDTs since Cassandra does not allow subfield updates on them.
+   * Returns the UDT fields object.
+   */
+  resolveColumnUDT(keyspace, table, column, field) {
+    const colType = this.getColumnType(keyspace, table, column);
+
+    // Extract UDT name from the column type (e.g. "frozen<address>" → "address", or bare "address")
+    let typeName = colType;
+    const frozenMatch = colType.match(/^frozen<([a-zA-Z_][a-zA-Z0-9_]*)>$/);
+    if (frozenMatch) {
+      throw new Error(
+        `Cannot update individual fields of frozen UDT column "${column}" (type: ${colType}). ` +
+        `Cassandra requires replacing the entire value. Use .set("${column}", {...}) instead, ` +
+        `or change the schema to use a non-frozen UDT.`
+      );
+    }
+
+    const fields = this.getUDTFields(keyspace, typeName);
+    if (!(field in fields)) {
+      throw new Error(
+        `Field "${field}" not found in UDT "${typeName}". Available fields: [${Object.keys(fields).join(', ')}]`
+      );
+    }
+    return fields;
+  }
+
   // ── Internal ──
 
   /**

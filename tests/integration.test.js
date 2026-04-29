@@ -14,7 +14,7 @@ const assert = require('node:assert/strict');
 const path = require('path');
 
 const { SchemaRegistry } = require('../src/SchemaRegistry');
-const { CQLBuilder } = require('../src/CQLBuilder');
+const { CQLBuilder, CQLFunction } = require('../src/CQLBuilder');
 const { DDLGenerator } = require('../src/DDLGenerator');
 const { MigrationDiffer } = require('../src/MigrationDiffer');
 const { LiveSchemaIntrospector } = require('../src/LiveSchemaIntrospector');
@@ -49,7 +49,9 @@ const testSchema = {
         user_id: 'uuid',
         email: 'text',
         name: 'text',
+        address: 'address',
         created_at: 'timestamp',
+        updated_at: 'timestamp',
         tags: 'set<text>',
         preferences: 'map<text, text>',
       },
@@ -485,6 +487,300 @@ describe('Integration — real Cassandra', { timeout: 120_000 }, () => {
         !s.includes('default_time_to_live = 0')
       );
       assert.equal(nonTrivialStmts.length, 0, 'Schema should be in sync after applying migration (ignoring index/option format diffs)');
+    });
+  });
+
+  // ── TTL=0 (USING TTL 0 clears TTL) ──────────────────────────────────────────
+
+  describe('TTL=0 support', () => {
+    it('INSERTs with TTL then clears it with TTL=0 UPDATE', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+
+      // Insert with TTL 600
+      const { cql: insCql, params: insParams } = cql.insert(TEST_KEYSPACE, 'users')
+        .values({ user_id: id, email: 'ttl-test@test.com', name: 'TTL User' })
+        .ttl(600)
+        .build();
+      await client.execute(insCql, insParams, { prepare: true });
+
+      // Verify TTL is set (> 0)
+      const ttlResult1 = await client.execute(
+        `SELECT TTL(email) AS email_ttl FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [id], { prepare: true }
+      );
+      assert.ok(ttlResult1.rows[0].email_ttl > 0, 'TTL should be set after INSERT with TTL');
+
+      // Clear TTL using UPDATE with TTL 0
+      const { cql: updCql, params: updParams } = cql.update(TEST_KEYSPACE, 'users')
+        .set('email', 'ttl-test@test.com')
+        .where('user_id', id)
+        .ttl(0)
+        .build();
+      await client.execute(updCql, updParams, { prepare: true });
+
+      // Verify TTL is cleared (null = no TTL)
+      const ttlResult2 = await client.execute(
+        `SELECT TTL(email) AS email_ttl FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [id], { prepare: true }
+      );
+      assert.equal(ttlResult2.rows[0].email_ttl, null, 'TTL should be null after UPDATE with TTL 0');
+
+      // Cleanup
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+
+    it('INSERTs with TTL=0 (no expiry)', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+
+      const { cql: insCql, params } = cql.insert(TEST_KEYSPACE, 'users')
+        .values({ user_id: id, email: 'ttl0@test.com', name: 'No Expiry' })
+        .ttl(0)
+        .build();
+      await client.execute(insCql, params, { prepare: true });
+
+      // Verify row exists with no TTL
+      const result = await client.execute(
+        `SELECT email, TTL(email) AS email_ttl FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [id], { prepare: true }
+      );
+      assert.equal(result.rows[0].email, 'ttl0@test.com');
+      assert.equal(result.rows[0].email_ttl, null, 'TTL should be null for TTL=0 insert');
+
+      // Cleanup
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+  });
+
+  // ── UDT setField ─────────────────────────────────────────────────────
+
+  describe('UDT setField', () => {
+    it('inserts a row with UDT then updates individual fields', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+
+      // Insert with full UDT value
+      const { cql: insCql, params: insParams } = cql.insert(TEST_KEYSPACE, 'users')
+        .values({
+          user_id: id,
+          email: 'udt@test.com',
+          name: 'UDT User',
+          address: { street: '100 Main St', city: 'Boston', state: 'MA', zip: '02101', country: 'US' },
+        })
+        .build();
+      await client.execute(insCql, insParams, { prepare: true });
+
+      // Update a single UDT field
+      const { cql: updCql, params: updParams } = cql.update(TEST_KEYSPACE, 'users')
+        .setField('address', 'city', 'New York')
+        .setField('address', 'zip', '10001')
+        .where('user_id', id)
+        .build();
+      await client.execute(updCql, updParams, { prepare: true });
+
+      // Verify
+      const result = await client.execute(
+        `SELECT address FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [id], { prepare: true }
+      );
+      const addr = result.rows[0].address;
+      assert.equal(addr.city, 'New York', 'city should be updated');
+      assert.equal(addr.zip, '10001', 'zip should be updated');
+      assert.equal(addr.street, '100 Main St', 'street should be unchanged');
+      assert.equal(addr.state, 'MA', 'state should be unchanged');
+
+      // Cleanup
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+
+    it('mixes setField with regular set', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+
+      // Insert
+      const { cql: insCql, params: insParams } = cql.insert(TEST_KEYSPACE, 'users')
+        .values({
+          user_id: id,
+          email: 'mix@test.com',
+          name: 'Mix User',
+          address: { street: '200 Oak Ave', city: 'Chicago', state: 'IL', zip: '60601', country: 'US' },
+        })
+        .build();
+      await client.execute(insCql, insParams, { prepare: true });
+
+      // Update both regular column and UDT field
+      const { cql: updCql, params: updParams } = cql.update(TEST_KEYSPACE, 'users')
+        .set('name', 'Updated Mix User')
+        .setField('address', 'city', 'Detroit')
+        .where('user_id', id)
+        .build();
+      await client.execute(updCql, updParams, { prepare: true });
+
+      // Verify
+      const result = await client.execute(
+        `SELECT name, address FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [id], { prepare: true }
+      );
+      assert.equal(result.rows[0].name, 'Updated Mix User');
+      assert.equal(result.rows[0].address.city, 'Detroit');
+      assert.equal(result.rows[0].address.street, '200 Oak Ave', 'unchanged fields preserved');
+
+      // Cleanup
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+
+    it('rejects setField on a frozen UDT column before hitting Cassandra', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      // Register a separate schema where address is frozen
+      const frozenRegistry = new SchemaRegistry();
+      frozenRegistry.register({
+        ...testSchema,
+        keyspace: TEST_KEYSPACE,
+        tables: {
+          ...testSchema.tables,
+          users: {
+            ...testSchema.tables.users,
+            columns: {
+              ...testSchema.tables.users.columns,
+              address: 'frozen<address>',  // frozen — subfield updates are invalid
+            },
+          },
+        },
+      });
+      const frozenCql = new CQLBuilder(frozenRegistry);
+
+      // setField must throw at build time, never sending a query to Cassandra
+      assert.throws(
+        () => frozenCql.update(TEST_KEYSPACE, 'users')
+          .setField('address', 'city', 'NYC')
+          .where('user_id', cassandra.types.Uuid.random())
+          .build(),
+        /frozen UDT/
+      );
+    });
+  });
+
+  // ── CQLFunction (server-side functions) ─────────────────────────────
+
+  describe('CQLFunction — server-side functions', () => {
+    it('INSERTs with now() for timeuuid and toTimestamp(now()) for timestamp', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const uid = cassandra.types.Uuid.random();
+
+      // Insert an order using server-side now() for the timeuuid order_id
+      // and toTimestamp(now()) for the created_at timestamp
+      const { cql: insCql, params } = cql.insert(TEST_KEYSPACE, 'orders_by_user')
+        .values({
+          user_id: uid,
+          order_id: CQLBuilder.fn('now'),
+          status: 'pending',
+          total_cents: 4999,
+          created_at: CQLBuilder.fn('toTimestamp', CQLBuilder.fn('now')),
+        })
+        .build();
+
+      // Verify the CQL uses function calls, not parameterized values
+      assert.match(insCql, /now\(\)/);
+      assert.match(insCql, /toTimestamp\(now\(\)\)/);
+      // Only 3 params (user_id, status, total_cents) — not 5
+      assert.equal(params.length, 3);
+
+      await client.execute(insCql, params, { prepare: true });
+
+      // Verify the row was inserted with server-generated values
+      const result = await client.execute(
+        `SELECT order_id, created_at, status FROM ${TEST_KEYSPACE}.orders_by_user WHERE user_id = ?`,
+        [uid], { prepare: true }
+      );
+      assert.equal(result.rows.length, 1);
+      assert.equal(result.rows[0].status, 'pending');
+      // order_id should be a valid TimeUuid generated by the server
+      assert.ok(result.rows[0].order_id, 'order_id should be set by now()');
+      // created_at should be a valid Date
+      assert.ok(result.rows[0].created_at instanceof Date, 'created_at should be a Date from toTimestamp(now())');
+
+      // Cleanup
+      await client.execute(
+        `DELETE FROM ${TEST_KEYSPACE}.orders_by_user WHERE user_id = ? AND order_id = ?`,
+        [uid, result.rows[0].order_id], { prepare: true }
+      );
+    });
+
+    it('UPDATEs with toTimestamp(now()) for updated_at', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+
+      // Insert without timestamp
+      const { cql: insCql, params: insParams } = cql.insert(TEST_KEYSPACE, 'users')
+        .values({ user_id: id, email: 'fn-upd@test.com', name: 'Fn Update User' })
+        .build();
+      await client.execute(insCql, insParams, { prepare: true });
+
+      // Update using server-side function
+      const { cql: updCql, params: updParams } = cql.update(TEST_KEYSPACE, 'users')
+        .set('name', 'Updated Fn User')
+        .set('updated_at', CQLBuilder.fn('toTimestamp', CQLBuilder.fn('now')))
+        .where('user_id', id)
+        .build();
+
+      assert.match(updCql, /updated_at = toTimestamp\(now\(\)\)/);
+      // Only 2 params: name value + where value (updated_at is a function, not a param)
+      assert.equal(updParams.length, 2);
+
+      await client.execute(updCql, updParams, { prepare: true });
+
+      // Verify
+      const result = await client.execute(
+        `SELECT name, updated_at FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [id], { prepare: true }
+      );
+      assert.equal(result.rows[0].name, 'Updated Fn User');
+      assert.ok(result.rows[0].updated_at instanceof Date, 'updated_at should be set by server-side function');
+
+      // Cleanup
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+
+    it('uses uuid() to generate a primary key in INSERT', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const { cql: insCql, params } = cql.insert(TEST_KEYSPACE, 'products')
+        .values({
+          product_id: CQLBuilder.fn('uuid'),
+          name: 'Server UUID Product',
+          description: 'Generated with uuid()',
+          price_cents: 1500,
+          category: 'fn-test',
+          in_stock: true,
+        })
+        .build();
+
+      assert.match(insCql, /uuid\(\)/);
+      // product_id is a function, so only 5 params
+      assert.equal(params.length, 5);
+
+      await client.execute(insCql, params, { prepare: true });
+
+      // Verify by querying the category index
+      const result = await client.execute(
+        `SELECT product_id, name FROM ${TEST_KEYSPACE}.products WHERE category = ?`,
+        ['fn-test'], { prepare: true }
+      );
+      assert.ok(result.rows.length >= 1);
+      const row = result.rows.find(r => r.name === 'Server UUID Product');
+      assert.ok(row, 'Should find the product inserted with uuid()');
+      assert.ok(row.product_id, 'product_id should be set by server-side uuid()');
+
+      // Cleanup
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.products WHERE product_id = ?`, [row.product_id], { prepare: true });
     });
   });
 });
