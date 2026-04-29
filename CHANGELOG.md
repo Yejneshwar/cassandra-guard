@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v1.2.0...cassandra-guard-v1.2.1) (2026-04-29)
+
+
+### Bug Fixes
+
+* **package.json:** repo url AGAIN (it was a case issue 😔) ([9e4ade4](https://github.com/Yejneshwar/cassandra-guard/commit/9e4ade4e26963be42b1f53b416dadd54a939a865))
+
 ## [1.2.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v1.1.1...cassandra-guard-v1.2.0) (2026-04-29)
 
 
