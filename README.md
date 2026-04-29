@@ -11,13 +11,13 @@ Cassandra doesn't enforce a lot of the things that can go wrong: referencing a c
 ## Install
 
 ```bash
-npm install cassandra-schema-guard
+npm install cassandra-guard
 ```
 
 ## Quick Start
 
 ```javascript
-const { SchemaRegistry, CQLBuilder } = require('cassandra-schema-guard');
+const { SchemaRegistry, CQLBuilder } = require('cassandra-guard');
 
 // 1. Load your schema
 const registry = new SchemaRegistry();
@@ -185,7 +185,7 @@ cql.batch('LOGGED')  // or 'UNLOGGED', 'COUNTER'
 ## DDL Generation
 
 ```javascript
-const { DDLGenerator } = require('cassandra-schema-guard');
+const { DDLGenerator } = require('cassandra-guard');
 
 const gen = new DDLGenerator(registry);
 const statements = gen.generateKeyspace('ecommerce');
@@ -197,7 +197,7 @@ const statements = gen.generateKeyspace('ecommerce');
 Compare two schema versions and get migration CQL:
 
 ```javascript
-const { MigrationDiffer } = require('cassandra-schema-guard');
+const { MigrationDiffer } = require('cassandra-guard');
 
 const differ = new MigrationDiffer();
 const result = differ.diff(oldSchema, newSchema);
@@ -215,7 +215,7 @@ Compare your JSON schema against a running cluster:
 
 ```javascript
 const cassandra = require('cassandra-driver');
-const { LiveSchemaIntrospector, MigrationDiffer } = require('cassandra-schema-guard');
+const { LiveSchemaIntrospector, MigrationDiffer } = require('cassandra-guard');
 
 const client = new cassandra.Client({ contactPoints: ['localhost'], localDataCenter: 'dc1' });
 await client.connect();
