@@ -4,13 +4,13 @@
   "description": "Schema registry, CQL builder, migration diffing, and CLI for Cassandra",
   "license": "MIT",
   "author": "Yejneshwar Sivamoorthy",
-  "homepage": "https://github.com/yejneshwar/cassandra-guard#readme",
+  "homepage": "https://github.com/Yejneshwar/cassandra-guard#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yejneshwar/cassandra-guard"
+    "url": "git+https://github.com/Yejneshwar/cassandra-guard.git"
   },
   "bugs": {
-    "url": "https://github.com/yejneshwar/cassandra-guard/issues"
+    "url": "https://github.com/Yejneshwar/cassandra-guard/issues"
   },
   "keywords": [
     "cassandra",
