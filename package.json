@@ -7,7 +7,7 @@
   "homepage": "https://github.com/yejneshwar/cassandra-guard#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yejneshwar/cassandra-guard.git"
+    "url": "https://github.com/yejneshwar/cassandra-guard"
   },
   "bugs": {
     "url": "https://github.com/yejneshwar/cassandra-guard/issues"
@@ -31,7 +31,7 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "csg": "./src/cli.js"
+    "csg": "src/cli.js"
   },
   "files": [
     "src/",
