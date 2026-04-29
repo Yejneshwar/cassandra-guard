@@ -121,7 +121,7 @@ cql.select('ks', 'table')
 ```javascript
 cql.insert('ks', 'table')
   .values({ pk_col: 'val', col2: 'val2' }) // must include full primary key
-  .ttl(3600)
+  .ttl(3600)                               // or ttl(0) to explicitly clear TTL
   .timestamp(Date.now() * 1000)
   .ifNotExists()
   .build();
@@ -133,6 +133,7 @@ cql.insert('ks', 'table')
 cql.update('ks', 'table')
   .set('col', 'new_value')            // cannot SET primary key columns
   .setAll({ col1: 'a', col2: 'b' })
+  .setField('address', 'city', 'NYC') // UDT subfield: SET address.city = ?
   .addToSet('tags', new Set(['vip'])) // validates column is set<...>
   .removeFromSet('tags', new Set(['old']))
   .appendToList('items', ['new'])     // validates column is list<...>
@@ -141,9 +142,11 @@ cql.update('ks', 'table')
   .where('pk_col', value)             // must include full primary key
   .if_('col', 'expected_value')       // lightweight transactions
   .ifExists()
-  .ttl(7200)
+  .ttl(7200)                          // or ttl(0) to clear TTL
   .build();
 ```
+
+> **UDT subfield updates:** `.setField(column, field, value)` validates that the column is a non-frozen UDT and the field exists in the schema's `types` definition. Frozen UDT columns are rejected at build time — use `.set('address', {...})` to replace the entire value instead.
 
 ### DELETE
 
@@ -170,6 +173,39 @@ cql.batch('LOGGED')  // or 'UNLOGGED', 'COUNTER'
   .build();
 ```
 
+## Server-Side Functions
+
+Use `CQLBuilder.fn()` to safely insert Cassandra server-side functions like `now()`, `uuid()`, or `toTimestamp(now())` into your queries. Only whitelisted function names are allowed — arbitrary strings are rejected to prevent CQL injection.
+
+```javascript
+// INSERT with server-generated timestamp
+cql.insert('ks', 'orders')
+  .values({
+    user_id: 'uid-1',
+    order_id: CQLBuilder.fn('now'),                              // → now()
+    created_at: CQLBuilder.fn('toTimestamp', CQLBuilder.fn('now')), // → toTimestamp(now())
+    status: 'pending',
+  })
+  .build();
+// → VALUES (?, now(), toTimestamp(now()), ?)
+//   params: ['uid-1', 'pending']  — functions are NOT parameterized
+
+// UPDATE with server-side timestamp
+cql.update('ks', 'users')
+  .set('updated_at', CQLBuilder.fn('toTimestamp', CQLBuilder.fn('now')))
+  .where('user_id', 'uid-1')
+  .build();
+// → SET updated_at = toTimestamp(now()) WHERE user_id = ?
+
+// Primitive arguments are parameterized as ?
+CQLBuilder.fn('minTimeuuid', '2024-01-01')  // → minTimeuuid(?), params: ['2024-01-01']
+
+// Unknown functions are rejected
+CQLBuilder.fn('DROP');  // → CQLBuildError: Unknown CQL function "DROP"
+```
+
+Allowed functions include: `now`, `uuid`, `toTimestamp`, `toDate`, `toUnixTimestamp`, `currentTimestamp`, `currentDate`, `currentTime`, `currentTimeUUID`, `minTimeuuid`, `maxTimeuuid`, `token`, blob conversions, and aggregates (`count`, `min`, `max`, `sum`, `avg`).
+
 ## What Gets Validated
 
 | Check | When |
@@ -181,6 +217,8 @@ cql.batch('LOGGED')  // or 'UNLOGGED', 'COUNTER'
 | ORDER BY only on clustering columns | SELECT |
 | Collection ops match column type | UPDATE (addToSet on set<>, appendToList on list<>, putToMap on map<>) |
 | Counter ops only on counter columns | UPDATE increment/decrement |
+| UDT field exists and column is non-frozen | UPDATE setField |
+| Server-side function is whitelisted | INSERT/UPDATE values using CQLBuilder.fn() |
 
 ## DDL Generation
 
