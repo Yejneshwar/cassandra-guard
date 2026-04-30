@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v1.2.1...cassandra-guard-v2.0.0) (2026-04-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* Prior to this version, registry ran validations only for json schema
+
+### Features
+
+* UDT validation during schema registration ([1593a4b](https://github.com/Yejneshwar/cassandra-guard/commit/1593a4b019f5d59ac8de31fca25ca680cc0ca3aa))
+
 ## [1.2.1](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v1.2.0...cassandra-guard-v1.2.1) (2026-04-29)
 
 
