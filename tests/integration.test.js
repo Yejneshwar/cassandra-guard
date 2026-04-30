@@ -783,4 +783,288 @@ describe('Integration — real Cassandra', { timeout: 120_000 }, () => {
       await client.execute(`DELETE FROM ${TEST_KEYSPACE}.products WHERE product_id = ?`, [row.product_id], { prepare: true });
     });
   });
+
+  // ── Schema cross-validation (UDT references) ─────────────────────────────
+
+  describe('Schema cross-validation — UDT references', () => {
+    it('rejects schema with undefined UDT before hitting Cassandra', (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const badRegistry = new SchemaRegistry();
+      assert.throws(
+        () => badRegistry.register({
+          keyspace: 'bad_ks',
+          replication: { class: 'SimpleStrategy', replication_factor: 1 },
+          tables: {
+            things: {
+              columns: {
+                id: 'uuid',
+                location: 'frozen<geo_point>',  // geo_point is not defined
+              },
+              partition_key: ['id'],
+            },
+          },
+        }),
+        (err) => {
+          assert.ok(err.message.includes('undefined type "geo_point"'));
+          return true;
+        }
+      );
+    });
+
+    it('rejects schema with undefined UDT inside a collection type', (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const badRegistry = new SchemaRegistry();
+      assert.throws(
+        () => badRegistry.register({
+          keyspace: 'bad_ks2',
+          replication: { class: 'SimpleStrategy', replication_factor: 1 },
+          tables: {
+            things: {
+              columns: {
+                id: 'uuid',
+                addresses: 'list<frozen<address>>',  // address is not defined
+              },
+              partition_key: ['id'],
+            },
+          },
+        }),
+        (err) => {
+          assert.ok(err.message.includes('undefined type "address"'));
+          return true;
+        }
+      );
+    });
+
+    it('rejects schema where UDT field references another undefined UDT', (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const badRegistry = new SchemaRegistry();
+      assert.throws(
+        () => badRegistry.register({
+          keyspace: 'bad_ks3',
+          replication: { class: 'SimpleStrategy', replication_factor: 1 },
+          types: {
+            order_info: {
+              fields: {
+                total: 'int',
+                shipping_addr: 'frozen<address>',  // address is not defined
+              },
+            },
+          },
+          tables: {
+            orders: {
+              columns: {
+                id: 'uuid',
+                info: 'frozen<order_info>',
+              },
+              partition_key: ['id'],
+            },
+          },
+        }),
+        (err) => {
+          assert.ok(err.message.includes('UDT "order_info"'));
+          assert.ok(err.message.includes('undefined type "address"'));
+          return true;
+        }
+      );
+    });
+
+    it('creates DDL and executes for schema with nested UDTs', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const nestedKs = 'csg_nested_udt_test';
+
+      // Cleanup from any prior run
+      try { await client.execute(`DROP KEYSPACE IF EXISTS ${nestedKs}`); } catch { /* ignore */ }
+
+      const nestedSchema = {
+        keyspace: nestedKs,
+        replication: { class: 'SimpleStrategy', replication_factor: 1 },
+        types: {
+          geo_point: {
+            fields: { lat: 'double', lng: 'double' },
+          },
+          address: {
+            fields: {
+              street: 'text',
+              city: 'text',
+              zip: 'text',
+              location: 'frozen<geo_point>',
+            },
+          },
+        },
+        tables: {
+          stores: {
+            columns: {
+              store_id: 'uuid',
+              name: 'text',
+              main_address: 'frozen<address>',
+              coordinates: 'frozen<geo_point>',
+              secondary_addrs: 'list<frozen<address>>',
+            },
+            partition_key: ['store_id'],
+          },
+        },
+      };
+
+      // Registration should succeed (all UDTs are defined)
+      const nestedRegistry = new SchemaRegistry();
+      nestedRegistry.register(nestedSchema);
+      const nestedDdl = new DDLGenerator(nestedRegistry);
+
+      // Generate and execute DDL
+      const stmts = nestedDdl.generateKeyspace(nestedKs);
+      assert.ok(stmts.length > 0);
+
+      for (const stmt of stmts) {
+        await client.execute(stmt);
+      }
+
+      // Verify UDTs exist
+      const udtResult = await client.execute(
+        'SELECT type_name FROM system_schema.types WHERE keyspace_name = ?',
+        [nestedKs], { prepare: true }
+      );
+      const udtNames = udtResult.rows.map(r => r.type_name).sort();
+      assert.deepEqual(udtNames, ['address', 'geo_point']);
+
+      // Verify table exists and has the right columns
+      const colResult = await client.execute(
+        'SELECT column_name, type FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?',
+        [nestedKs, 'stores'], { prepare: true }
+      );
+      const colNames = colResult.rows.map(r => r.column_name).sort();
+      assert.ok(colNames.includes('main_address'));
+      assert.ok(colNames.includes('coordinates'));
+      assert.ok(colNames.includes('secondary_addrs'));
+
+      // Insert a row with nested UDT values
+      const nestedCql = new CQLBuilder(nestedRegistry);
+      const storeId = cassandra.types.Uuid.random();
+      const { cql: insCql, params } = nestedCql.insert(nestedKs, 'stores')
+        .values({
+          store_id: storeId,
+          name: 'Test Store',
+          main_address: {
+            street: '123 Main St',
+            city: 'Boston',
+            zip: '02101',
+            location: { lat: 42.36, lng: -71.06 },
+          },
+          coordinates: { lat: 42.36, lng: -71.06 },
+          secondary_addrs: [
+            { street: '456 Oak Ave', city: 'Cambridge', zip: '02139', location: { lat: 42.37, lng: -71.09 } },
+          ],
+        })
+        .build();
+
+      await client.execute(insCql, params, { prepare: true });
+
+      // Read back and verify
+      const readResult = await client.execute(
+        `SELECT * FROM ${nestedKs}.stores WHERE store_id = ?`,
+        [storeId], { prepare: true }
+      );
+      assert.equal(readResult.rows.length, 1);
+      assert.equal(readResult.rows[0].name, 'Test Store');
+      assert.equal(readResult.rows[0].main_address.city, 'Boston');
+      assert.equal(readResult.rows[0].coordinates.lat, 42.36);
+
+      // Cleanup
+      await client.execute(`DROP KEYSPACE IF EXISTS ${nestedKs}`);
+    });
+
+    it('introspected schema passes re-registration with UDT validation', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      // Introspect the live test keyspace (which has the 'address' UDT and
+      // the 'users' table referencing it)
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      // The introspector produces index objects with `type: null` and
+      // `using` fields that don't conform to the meta-schema.
+      // Normalize them so the meta-schema validation passes — we're testing
+      // UDT cross-validation here, not introspector index fidelity.
+      for (const tableDef of Object.values(liveSchema.tables)) {
+        if (tableDef.indexes) {
+          tableDef.indexes = tableDef.indexes.map(idx => {
+            if (typeof idx === 'string') return idx;
+            const cleaned = { column: idx.column };
+            if (idx.name) cleaned.name = idx.name;
+            if (idx.type && ['values', 'keys', 'entries', 'full'].includes(idx.type)) {
+              cleaned.type = idx.type;
+            }
+            if (idx.using) cleaned.using = idx.using;
+            return cleaned;
+          });
+        }
+      }
+
+      // Re-registering the introspected schema must pass cross-validation,
+      // including the new UDT reference checks
+      const freshRegistry = new SchemaRegistry();
+      const ks = freshRegistry.register(liveSchema);
+      assert.equal(ks, TEST_KEYSPACE);
+
+      // The re-registered schema should be fully usable
+      const freshCql = new CQLBuilder(freshRegistry);
+      const id = cassandra.types.Uuid.random();
+      const { cql: insCql, params } = freshCql.insert(TEST_KEYSPACE, 'users')
+        .values({
+          user_id: id,
+          email: 'revalidated@test.com',
+          name: 'Re-validated User',
+        })
+        .build();
+
+      await client.execute(insCql, params, { prepare: true });
+
+      // Verify
+      const result = await client.execute(
+        `SELECT email FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [id], { prepare: true }
+      );
+      assert.equal(result.rows[0].email, 'revalidated@test.com');
+
+      // Cleanup
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+
+    it('collects all undefined UDT errors across multiple tables', (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const badRegistry = new SchemaRegistry();
+      assert.throws(
+        () => badRegistry.register({
+          keyspace: 'bad_multi',
+          replication: { class: 'SimpleStrategy', replication_factor: 1 },
+          tables: {
+            table_a: {
+              columns: {
+                id: 'uuid',
+                loc: 'frozen<geo_point>',
+              },
+              partition_key: ['id'],
+            },
+            table_b: {
+              columns: {
+                id: 'uuid',
+                info: 'frozen<metadata>',
+              },
+              partition_key: ['id'],
+            },
+          },
+        }),
+        (err) => {
+          // Both undefined types should be reported in a single error
+          assert.ok(err.message.includes('geo_point'));
+          assert.ok(err.message.includes('metadata'));
+          return true;
+        }
+      );
+    });
+  });
 });

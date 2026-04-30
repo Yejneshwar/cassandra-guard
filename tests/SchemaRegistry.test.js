@@ -131,4 +131,262 @@ describe('SchemaRegistry', () => {
     assert.ok(loaded.length >= 1);
     assert.ok(loaded.includes('ecommerce'));
   });
+
+  // ── UDT reference validation ──────────────────────────────────────────────
+
+  it('rejects column with frozen<udt> referencing undefined type', () => {
+    const r = new SchemaRegistry();
+    assert.throws(() => r.register({
+      keyspace: 'test',
+      tables: {
+        users: {
+          columns: { id: 'uuid', addr: 'frozen<address>' },
+          partition_key: ['id'],
+        },
+      },
+    }), (err) => {
+      assert.ok(err instanceof SchemaValidationError);
+      assert.ok(err.message.includes('undefined type "address"'));
+      return true;
+    });
+  });
+
+  it('rejects column with bare UDT name referencing undefined type', () => {
+    const r = new SchemaRegistry();
+    assert.throws(() => r.register({
+      keyspace: 'test',
+      tables: {
+        users: {
+          columns: { id: 'uuid', addr: 'address' },
+          partition_key: ['id'],
+        },
+      },
+    }), (err) => {
+      assert.ok(err instanceof SchemaValidationError);
+      assert.ok(err.message.includes('undefined type "address"'));
+      return true;
+    });
+  });
+
+  it('rejects column with list<frozen<udt>> referencing undefined type', () => {
+    const r = new SchemaRegistry();
+    assert.throws(() => r.register({
+      keyspace: 'test',
+      tables: {
+        users: {
+          columns: { id: 'uuid', addrs: 'list<frozen<address>>' },
+          partition_key: ['id'],
+        },
+      },
+    }), (err) => {
+      assert.ok(err instanceof SchemaValidationError);
+      assert.ok(err.message.includes('undefined type "address"'));
+      return true;
+    });
+  });
+
+  it('rejects column with map value referencing undefined UDT', () => {
+    const r = new SchemaRegistry();
+    assert.throws(() => r.register({
+      keyspace: 'test',
+      tables: {
+        users: {
+          columns: { id: 'uuid', addrs: 'map<text, frozen<location>>' },
+          partition_key: ['id'],
+        },
+      },
+    }), (err) => {
+      assert.ok(err instanceof SchemaValidationError);
+      assert.ok(err.message.includes('undefined type "location"'));
+      return true;
+    });
+  });
+
+  it('rejects column with object-style column def referencing undefined UDT', () => {
+    const r = new SchemaRegistry();
+    assert.throws(() => r.register({
+      keyspace: 'test',
+      tables: {
+        users: {
+          columns: {
+            id: 'uuid',
+            addr: { type: 'frozen<address>', static: false },
+          },
+          partition_key: ['id'],
+        },
+      },
+    }), (err) => {
+      assert.ok(err instanceof SchemaValidationError);
+      assert.ok(err.message.includes('undefined type "address"'));
+      return true;
+    });
+  });
+
+  it('accepts column referencing a defined UDT', () => {
+    const r = new SchemaRegistry();
+    // Should NOT throw — 'address' is defined in types
+    const ks = r.register({
+      keyspace: 'test',
+      types: {
+        address: {
+          fields: { street: 'text', city: 'text' },
+        },
+      },
+      tables: {
+        users: {
+          columns: {
+            id: 'uuid',
+            home: 'frozen<address>',
+            work: 'address',
+            addrs: 'list<frozen<address>>',
+          },
+          partition_key: ['id'],
+        },
+      },
+    });
+    assert.equal(ks, 'test');
+  });
+
+  it('rejects UDT field referencing undefined type', () => {
+    const r = new SchemaRegistry();
+    assert.throws(() => r.register({
+      keyspace: 'test',
+      types: {
+        order_info: {
+          fields: {
+            id: 'uuid',
+            shipping: 'frozen<address>',
+          },
+        },
+      },
+      tables: {
+        orders: {
+          columns: { id: 'uuid', info: 'frozen<order_info>' },
+          partition_key: ['id'],
+        },
+      },
+    }), (err) => {
+      assert.ok(err instanceof SchemaValidationError);
+      assert.ok(err.message.includes('UDT "order_info"'));
+      assert.ok(err.message.includes('undefined type "address"'));
+      return true;
+    });
+  });
+
+  it('accepts UDT fields referencing other defined UDTs', () => {
+    const r = new SchemaRegistry();
+    const ks = r.register({
+      keyspace: 'test',
+      types: {
+        address: {
+          fields: { street: 'text', city: 'text' },
+        },
+        order_info: {
+          fields: {
+            id: 'uuid',
+            shipping: 'frozen<address>',
+          },
+        },
+      },
+      tables: {
+        orders: {
+          columns: { id: 'uuid', info: 'frozen<order_info>' },
+          partition_key: ['id'],
+        },
+      },
+    });
+    assert.equal(ks, 'test');
+  });
+
+  it('collects multiple UDT errors in one throw', () => {
+    const r = new SchemaRegistry();
+    assert.throws(() => r.register({
+      keyspace: 'test',
+      tables: {
+        t1: {
+          columns: {
+            id: 'uuid',
+            a: 'frozen<type_a>',
+            b: 'frozen<type_b>',
+          },
+          partition_key: ['id'],
+        },
+      },
+    }), (err) => {
+      assert.ok(err instanceof SchemaValidationError);
+      assert.ok(err.message.includes('type_a'));
+      assert.ok(err.message.includes('type_b'));
+      return true;
+    });
+  });
+
+  it('does not flag native types as undefined UDTs', () => {
+    const r = new SchemaRegistry();
+    // All native types should pass without needing a types section
+    const ks = r.register({
+      keyspace: 'test',
+      tables: {
+        all_native: {
+          columns: {
+            a: 'text', b: 'int', c: 'uuid', d: 'bigint',
+            e: 'boolean', f: 'timestamp', g: 'float', h: 'double',
+            i: 'decimal', j: 'varint', k: 'inet', l: 'blob',
+            m: 'date', n: 'time', o: 'timeuuid', p: 'smallint',
+            q: 'tinyint', r: 'ascii', s: 'varchar', t: 'duration',
+            u: 'counter',
+          },
+          partition_key: ['a'],
+        },
+      },
+    });
+    assert.equal(ks, 'test');
+  });
+
+  it('does not flag collection types with only native inner types', () => {
+    const r = new SchemaRegistry();
+    const ks = r.register({
+      keyspace: 'test',
+      tables: {
+        collections: {
+          columns: {
+            id: 'uuid',
+            tags: 'set<text>',
+            scores: 'list<int>',
+            meta: 'map<text, text>',
+            coords: 'tuple<double, double>',
+            data: 'frozen<map<text, int>>',
+          },
+          partition_key: ['id'],
+        },
+      },
+    });
+    assert.equal(ks, 'test');
+  });
+
+  // ── MV clustering key validation ──────────────────────────────────────────
+
+  it('rejects MV with clustering key referencing non-existent base column', () => {
+    const r = new SchemaRegistry();
+    assert.throws(() => r.register({
+      keyspace: 'test',
+      tables: {
+        orders: {
+          columns: { id: 'uuid', status: 'text', total: 'int' },
+          partition_key: ['id'],
+          materialized_views: {
+            orders_by_status: {
+              select: ['*'],
+              partition_key: ['status'],
+              clustering_key: [{ column: 'ghost_col', order: 'ASC' }],
+              where: ['status IS NOT NULL', 'id IS NOT NULL'],
+            },
+          },
+        },
+      },
+    }), (err) => {
+      assert.ok(err instanceof SchemaValidationError);
+      assert.ok(err.message.includes('clustering key column "ghost_col" not found'));
+      return true;
+    });
+  });
 });

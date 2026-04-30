@@ -230,12 +230,37 @@ class SchemaRegistry {
 
   /**
    * Cross-validate: partition/clustering keys reference real columns,
-   * indexes reference real columns, etc.
+   * indexes reference real columns, UDT references resolve, etc.
    */
   _crossValidate(schema) {
     const errors = [];
+    const definedTypes = new Set(Object.keys(schema.types || {}));
+
+    // ── Validate UDT field types reference defined UDTs ──
+    for (const [typeName, typeDef] of Object.entries(schema.types || {})) {
+      for (const [fieldName, fieldType] of Object.entries(typeDef.fields)) {
+        const refs = this._extractUDTReferences(fieldType, definedTypes);
+        for (const ref of refs) {
+          errors.push(
+            `UDT "${typeName}": field "${fieldName}" references undefined type "${ref}"`
+          );
+        }
+      }
+    }
+
     for (const [tableName, tableDef] of Object.entries(schema.tables)) {
       const cols = Object.keys(tableDef.columns);
+
+      // ── Column types must reference defined UDTs ──
+      for (const [colName, colDef] of Object.entries(tableDef.columns)) {
+        const colType = typeof colDef === 'string' ? colDef : colDef.type;
+        const refs = this._extractUDTReferences(colType, definedTypes);
+        for (const ref of refs) {
+          errors.push(
+            `Table "${tableName}": column "${colName}" references undefined type "${ref}"`
+          );
+        }
+      }
 
       // Partition key columns must exist
       for (const pk of tableDef.partition_key) {
@@ -272,6 +297,12 @@ class SchemaRegistry {
             errors.push(`Table "${tableName}" MV "${mvName}": partition key "${pk}" not found`);
           }
         }
+        for (const ck of (mvDef.clustering_key || [])) {
+          const colName = typeof ck === 'string' ? ck : ck.column;
+          if (!cols.includes(colName)) {
+            errors.push(`Table "${tableName}" MV "${mvName}": clustering key column "${colName}" not found`);
+          }
+        }
       }
     }
 
@@ -281,6 +312,43 @@ class SchemaRegistry {
         errors
       );
     }
+  }
+
+  /**
+   * Built-in Cassandra native types that should NOT be treated as UDT references.
+   */
+  static get _NATIVE_TYPES() {
+    return new Set([
+      'ascii', 'bigint', 'blob', 'boolean', 'counter', 'date', 'decimal',
+      'double', 'duration', 'float', 'inet', 'int', 'smallint', 'text',
+      'time', 'timestamp', 'timeuuid', 'tinyint', 'uuid', 'varchar', 'varint',
+    ]);
+  }
+
+  /**
+   * Extract UDT name references from a Cassandra type string that are NOT
+   * defined in the schema. Returns an array of undefined type names.
+   *
+   * Handles: bare UDT names, frozen<udt>, list<frozen<udt>>,
+   * set<frozen<udt>>, map<text, frozen<udt>>, tuple<text, udt>, etc.
+   */
+  _extractUDTReferences(typeStr, definedTypes) {
+    const missing = [];
+    const nativeTypes = SchemaRegistry._NATIVE_TYPES;
+
+    // Tokenize: strip all wrapper keywords and angle brackets, extract bare identifiers
+    // Remove collection/frozen wrappers to get the inner type tokens
+    const stripped = typeStr.replace(/\b(frozen|list|set|map|tuple)\b/g, '');
+    // Extract all identifier tokens from what remains
+    const tokens = stripped.match(/[a-zA-Z_][a-zA-Z0-9_]*/g) || [];
+
+    for (const token of tokens) {
+      if (nativeTypes.has(token)) continue;       // built-in type
+      if (definedTypes.has(token)) continue;       // defined UDT
+      if (!missing.includes(token)) missing.push(token);
+    }
+
+    return missing;
   }
 }
 
