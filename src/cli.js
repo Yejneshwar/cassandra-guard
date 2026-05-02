@@ -153,18 +153,28 @@ program
   .option('-h, --host <host>', 'Cassandra host', 'localhost')
   .option('-p, --port <port>', 'Cassandra port', '9042')
   .option('--datacenter <dc>', 'Local datacenter name', 'datacenter1')
+  .option('--user <user>', 'Cassandra Username', null)
+  .option('--pass <pass>', 'Cassandra Password', null)
   .option('-o, --output <file>', 'Write migration to file')
   .action(async (schemaFile, opts) => {
     let client;
     try {
       const cassandra = require('cassandra-driver');
+      const authProvider = new cassandra.auth.PlainTextAuthProvider(
+        opts.user,
+        opts.pass
+      )
       client = new cassandra.Client({
         contactPoints: [opts.host],
         localDataCenter: opts.datacenter,
         protocolOptions: { port: parseInt(opts.port) },
+        authProvider: (opts.user ? authProvider : null)
       });
 
-      await client.connect();
+      await client.connect().catch((e) => {
+        console.error(`Error connecting to Cassandra: ${e.message}`);
+        process.exit(1);
+      });
 
       const registry = new SchemaRegistry();
       const ks = registry.loadFromFile(schemaFile);
