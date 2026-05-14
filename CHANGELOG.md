@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v2.0.0...cassandra-guard-v2.1.0) (2026-05-14)
+
+
+### Features
+
+* update dependencies ([597640d](https://github.com/Yejneshwar/cassandra-guard/commit/597640dbaf9e4ff5c7fa49730be8a952f4bce145))
+
 ## [2.0.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v1.2.1...cassandra-guard-v2.0.0) (2026-04-30)
 
 
