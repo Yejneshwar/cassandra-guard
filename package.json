@@ -1,6 +1,6 @@
 {
   "name": "cassandra-guard",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Schema registry, CQL builder, migration diffing, and CLI for Cassandra",
   "license": "MIT",
   "author": "Yejneshwar Sivamoorthy",
