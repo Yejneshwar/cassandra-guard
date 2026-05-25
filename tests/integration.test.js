@@ -18,6 +18,7 @@ const { CQLBuilder, CQLFunction } = require('../src/CQLBuilder');
 const { DDLGenerator } = require('../src/DDLGenerator');
 const { MigrationDiffer } = require('../src/MigrationDiffer');
 const { LiveSchemaIntrospector } = require('../src/LiveSchemaIntrospector');
+const { CompatibilityChecker } = require('../src/CompatibilityChecker');
 
 // ── Connection config ────────────────────────────────────────────────────────
 
@@ -1065,6 +1066,151 @@ describe('Integration — real Cassandra', { timeout: 120_000 }, () => {
           return true;
         }
       );
+    });
+  });
+
+  // ── CompatibilityChecker ──────────────────────────────────────────────
+
+  describe('CompatibilityChecker — live schema validation', () => {
+    it('verifies that the live schema is compatible with the local schema', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      // Extract the original schema from the registry
+      const appSchema = registry.get(TEST_KEYSPACE);
+
+      const checker = new CompatibilityChecker();
+      const errors = checker.check(liveSchema, appSchema);
+
+      // The DDL generated from appSchema was perfectly applied to Cassandra,
+      // so the live schema should be fully compatible.
+      assert.deepEqual(errors, []);
+    });
+
+    it('rejects compatibility if the local schema expects a column that is not in the live DB', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      // Clone appSchema and add a fake required column
+      const appSchema = JSON.parse(JSON.stringify(registry.get(TEST_KEYSPACE)));
+      appSchema.tables.users.columns.fake_required_col = { type: 'text' };
+
+      const checker = new CompatibilityChecker();
+      const errors = checker.check(liveSchema, appSchema);
+
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], new RegExp(`Missing column: ${TEST_KEYSPACE}\\.users\\.fake_required_col`));
+    });
+
+    it('rejects compatibility if the local schema expects a table that is not in the live DB', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      const appSchema = JSON.parse(JSON.stringify(registry.get(TEST_KEYSPACE)));
+      appSchema.tables.fake_future_table = {
+        columns: { id: { type: 'uuid' } },
+        partition_key: ['id'],
+        clustering_key: []
+      };
+
+      const checker = new CompatibilityChecker();
+      const errors = checker.check(liveSchema, appSchema);
+
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], new RegExp(`Missing table: ${TEST_KEYSPACE}\\.fake_future_table`));
+    });
+
+    it('rejects compatibility if the local schema expects a different column type than the live DB', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      const appSchema = JSON.parse(JSON.stringify(registry.get(TEST_KEYSPACE)));
+      // Live DB has 'text' for email, let's pretend app expects 'int'
+      appSchema.tables.users.columns.email.type = 'int';
+
+      const checker = new CompatibilityChecker();
+      const errors = checker.check(liveSchema, appSchema);
+
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], new RegExp(`Type mismatch in column ${TEST_KEYSPACE}\\.users\\.email: app expects int, but live has text`));
+    });
+
+    it('rejects compatibility if the primary key differs', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      const appSchema = JSON.parse(JSON.stringify(registry.get(TEST_KEYSPACE)));
+      // Change clustering key expectation
+      appSchema.tables.users.clustering_key = [{ column: 'email', order: 'ASC' }];
+
+      const checker = new CompatibilityChecker();
+      const errors = checker.check(liveSchema, appSchema);
+
+      assert.ok(errors.length > 0);
+      assert.match(errors[0], /Primary key mismatch/);
+    });
+
+    it('rejects compatibility if a required UDT is missing from the live DB', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      const appSchema = JSON.parse(JSON.stringify(registry.get(TEST_KEYSPACE)));
+      // App expects a new UDT
+      appSchema.types.future_udt = {
+        fields: { loc: 'text' }
+      };
+
+      const checker = new CompatibilityChecker();
+      const errors = checker.check(liveSchema, appSchema);
+
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], new RegExp(`Missing UDT: ${TEST_KEYSPACE}\\.future_udt`));
+    });
+
+    it('rejects compatibility if a field inside a UDT is missing from the live DB', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      const appSchema = JSON.parse(JSON.stringify(registry.get(TEST_KEYSPACE)));
+      // App expects a new field in the existing 'address' UDT
+      appSchema.types.address.fields.planet = 'text';
+
+      const checker = new CompatibilityChecker();
+      const errors = checker.check(liveSchema, appSchema);
+
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], new RegExp(`Missing UDT field: ${TEST_KEYSPACE}\\.address\\.planet`));
+    });
+
+    it('rejects compatibility if a field inside a UDT has a type mismatch', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(TEST_KEYSPACE);
+
+      const appSchema = JSON.parse(JSON.stringify(registry.get(TEST_KEYSPACE)));
+      // Live DB has 'text' for city, app expects 'int'
+      appSchema.types.address.fields.city = 'int';
+
+      const checker = new CompatibilityChecker();
+      const errors = checker.check(liveSchema, appSchema);
+
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], new RegExp(`Type mismatch in UDT ${TEST_KEYSPACE}\\.address field "city": app expects int, but live has text`));
     });
   });
 });

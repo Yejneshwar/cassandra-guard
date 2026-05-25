@@ -265,6 +265,27 @@ const differ = new MigrationDiffer();
 const result = differ.diff(liveSchema, targetSchema);
 ```
 
+## Live Schema Compatibility Validation
+
+Validate if a live production database can fully support your application's expected schema without breaking:
+
+```javascript
+const { LiveSchemaIntrospector, CompatibilityChecker } = require('cassandra-guard');
+
+const introspector = new LiveSchemaIntrospector(client);
+const liveSchema = await introspector.introspect('ecommerce');
+
+const checker = new CompatibilityChecker();
+const errors = checker.check(liveSchema, targetSchema);
+
+if (errors.length > 0) {
+  console.error('Database is incompatible:', errors);
+} else {
+  console.log('Database supports this application!');
+}
+```
+*Note: The compatibility checker enforces a strict structural subset check. It ignores extra tables, columns, or UDTs in the live database, ensuring forward-compatibility with future schemas.*
+
 ## Raw CQL Validation
 
 Validate hand-written CQL against the schema:
@@ -295,6 +316,9 @@ npx csg diff schemas/v1.json schemas/v2.json --strict  # exit 1 on breaking chan
 # Diff against live cluster
 npx csg diff-live schemas/ecommerce.json --host 10.0.0.1 --datacenter dc1
 
+# Check compatibility with live cluster
+npx csg check-live schemas/ecommerce.json --host 10.0.0.1 --datacenter dc1
+
 # Validate raw CQL
 npx csg check-cql schemas/ecommerce.json "SELECT email FROM ecommerce.users"
 ```
@@ -312,6 +336,9 @@ Add to your pipeline:
 
 # Generate migration and review
 - run: npx csg diff schemas/current.json schemas/new.json -o migration.cql
+
+# Ensure production database can support this schema before deploying app
+- run: npx csg check-live schemas/new.json --host prod-db.internal --user ci_user --pass my_secret
 ```
 
 ## License

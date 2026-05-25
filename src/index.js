@@ -3,6 +3,7 @@ const { CQLBuilder, CQLBuildError, CQLFunction, ALLOWED_CQL_FUNCTIONS } = requir
 const { DDLGenerator } = require('./DDLGenerator');
 const { MigrationDiffer } = require('./MigrationDiffer');
 const { LiveSchemaIntrospector } = require('./LiveSchemaIntrospector');
+const { CompatibilityChecker } = require('./CompatibilityChecker');
 
 module.exports = {
   SchemaRegistry,
@@ -14,4 +15,5 @@ module.exports = {
   DDLGenerator,
   MigrationDiffer,
   LiveSchemaIntrospector,
+  CompatibilityChecker,
 };

@@ -8,6 +8,7 @@ const { CQLBuilder } = require('./CQLBuilder');
 const { DDLGenerator } = require('./DDLGenerator');
 const { MigrationDiffer } = require('./MigrationDiffer');
 const { LiveSchemaIntrospector } = require('./LiveSchemaIntrospector');
+const { CompatibilityChecker } = require('./CompatibilityChecker');
 
 const program = new Command();
 
@@ -214,6 +215,64 @@ program
       }
 
       console.error(`\nSummary: ${result.statements.length} statements, ${result.warnings.length} warnings, ${result.breaking.length} breaking changes`);
+    } catch (err) {
+      console.error(`Error: ${err.message}`);
+      process.exit(1);
+    } finally {
+      if (client) await client.shutdown();
+    }
+  });
+
+// ── check-live ──
+program
+  .command('check-live')
+  .description('Check if a live Cassandra cluster is compatible with a schema JSON')
+  .argument('<schema-file>', 'Path to target schema JSON')
+  .option('-h, --host <host>', 'Cassandra host', 'localhost')
+  .option('-p, --port <port>', 'Cassandra port', '9042')
+  .option('--datacenter <dc>', 'Local datacenter name', 'datacenter1')
+  .option('--user <user>', 'Cassandra Username', null)
+  .option('--pass <pass>', 'Cassandra Password', null)
+  .action(async (schemaFile, opts) => {
+    let client;
+    try {
+      const cassandra = require('cassandra-driver');
+      const authProvider = new cassandra.auth.PlainTextAuthProvider(
+        opts.user,
+        opts.pass
+      );
+      client = new cassandra.Client({
+        contactPoints: [opts.host],
+        localDataCenter: opts.datacenter,
+        protocolOptions: { port: parseInt(opts.port) },
+        authProvider: (opts.user ? authProvider : null)
+      });
+
+      await client.connect().catch((e) => {
+        console.error(`Error connecting to Cassandra: ${e.message}`);
+        process.exit(1);
+      });
+
+      const registry = new SchemaRegistry();
+      const ks = registry.loadFromFile(schemaFile);
+      const appSchema = registry.get(ks);
+
+      const introspector = new LiveSchemaIntrospector(client);
+      const liveSchema = await introspector.introspect(ks);
+
+      const checker = new CompatibilityChecker();
+      const errors = checker.check(liveSchema, appSchema);
+
+      if (errors.length === 0) {
+        console.log(`✓ Live database is fully compatible with schema "${schemaFile}"`);
+        process.exit(0);
+      } else {
+        console.error(`x Live database is NOT compatible with schema "${schemaFile}":`);
+        for (const e of errors) {
+          console.error(`  - ${e}`);
+        }
+        process.exit(1);
+      }
     } catch (err) {
       console.error(`Error: ${err.message}`);
       process.exit(1);
