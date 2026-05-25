@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v2.1.0...cassandra-guard-v2.2.0) (2026-05-25)
+
+
+### Features
+
+* add live schema compatibility checker for CI/CD ([e3c7800](https://github.com/Yejneshwar/cassandra-guard/commit/e3c78008ca6cfdb74c8ab52f14be1853173fd857))
+
 ## [2.1.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v2.0.0...cassandra-guard-v2.1.0) (2026-05-14)
 
 
