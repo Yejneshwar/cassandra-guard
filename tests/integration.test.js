@@ -1299,19 +1299,26 @@ describe('Integration — real Cassandra', { timeout: 120_000 }, () => {
       );
     });
 
-    it('documents the deliberate guard: modern Cassandra ALLOWS TTL on collections (per-cell list), the builder still rejects it', async (t) => {
+    it('documents the deliberate guard: the builder rejects TTL on collections on EVERY server version', async (t) => {
       if (skipIfNoDb(t)) return;
 
-      // Since Cassandra 4.1, TTL(collection) is legal and returns a LIST of
-      // per-cell TTLs — almost never what a caller of .ttl() expects, so the
-      // builder keeps rejecting it (single-cell projections only). Raw CQL
-      // remains available for the per-cell form; pin the server behavior so
-      // a future change is noticed.
-      const result = await client.execute(
-        `SELECT TTL(tags) AS tags_ttl FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
-        [cassandra.types.Uuid.random()], { prepare: true }
-      );
-      assert.equal(result.rows.length, 0); // no row — the point is it PREPARED
+      // Server behavior is version-dependent: Cassandra 4.x rejects
+      // TTL(collection) outright ("Cannot use selection function ttl on
+      // non-frozen collection"), Cassandra 5 accepts it and returns a LIST
+      // of per-cell TTLs. Neither is what a caller of .ttl() expects, so
+      // the builder rejects collections everywhere (raw CQL remains
+      // available for the per-cell form). Accept either server outcome —
+      // the builder's rejection is the invariant.
+      try {
+        await client.execute(
+          `SELECT TTL(tags) AS tags_ttl FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+          [cassandra.types.Uuid.random()], { prepare: true }
+        );
+        console.log('    server accepts TTL(collection) — per-cell list (Cassandra 5+)');
+      } catch (err) {
+        assert.match(err.message, /ttl on non-frozen collection/i);
+        console.log('    server rejects TTL(collection) (Cassandra 4.x)');
+      }
 
       assert.throws(() => cql.select(TEST_KEYSPACE, 'users').ttl('tags'), /multi-cell/);
     });
