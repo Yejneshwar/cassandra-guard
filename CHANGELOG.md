@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.3.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v2.2.0...cassandra-guard-v2.3.0) (2026-07-06)
+
+
+### Features
+
+* add Version-aware validation: ([7cf4107](https://github.com/Yejneshwar/cassandra-guard/commit/7cf41075ba32febc1bc441aab493b51612901228))
+* TTL/WRITETIME projections and Map element delition support ([eec243f](https://github.com/Yejneshwar/cassandra-guard/commit/eec243ffcadbed99274dd822ff421a9323357826))
+
+
+### Bug Fixes
+
+* TTL issue ([ffe558c](https://github.com/Yejneshwar/cassandra-guard/commit/ffe558cb3b89c2b6844dba0c2985e9d0846bb9fd))
+
 ## [2.2.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v2.1.0...cassandra-guard-v2.2.0) (2026-05-25)
 
 
