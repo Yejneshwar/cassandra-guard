@@ -118,7 +118,7 @@ cql.select('ks', 'table')
   .build();
 ```
 
-> **TTL/WRITETIME projections:** `.ttl(column, alias?)` and `.writetime(column, alias?)` validate that the column exists, is not part of the primary key (key columns have no cell metadata), and is not a non-frozen collection (multi-cell).
+> **TTL/WRITETIME projections:** `.ttl(column, alias?)` and `.writetime(column, alias?)` validate that the column exists and is not part of the primary key (key columns have no cell metadata). Non-frozen collections are rejected by default — Cassandra 5.0+ can select their per-cell metadata as a LIST, so this is opt-in via version-aware validation (see below).
 
 ### INSERT
 
@@ -228,6 +228,27 @@ Allowed functions include: `now`, `uuid`, `toTimestamp`, `toDate`, `toUnixTimest
 | Server-side function is whitelisted | INSERT/UPDATE values using CQLBuilder.fn() |
 | TTL/WRITETIME only on regular single-cell columns | SELECT ttl()/writetime() |
 | Element deletion only on non-frozen map/list columns | DELETE element() |
+| Version-gated features against the target release | SELECT ttl()/writetime() on collections (5.0+) |
+
+## Version-Aware Validation
+
+Some CQL is only valid on certain Cassandra releases — e.g. `SELECT TTL(a_collection)` is rejected by 4.x but returns a per-cell list on 5.0+. The builder validates offline, so it can't know your cluster's version unless you tell it. Three ways, in precedence order:
+
+```javascript
+// 1. Explicit option on the builder
+const cql = new CQLBuilder(registry, { cassandraVersion: '5.0' });
+cql.select('ks', 'table').ttl('tags');  // allowed — per-cell TTL list on 5.0+
+
+// 2. Declared in the schema file itself (per keyspace)
+// { "keyspace": "my_app", "cassandra_version": "5.0", ... }
+
+// 3. Auto-detected from a live cluster
+const introspector = new LiveSchemaIntrospector(client);
+const version = await introspector.releaseVersion();   // e.g. "5.0.2"
+const liveAware = new CQLBuilder(registry, { cassandraVersion: version });
+```
+
+With no version configured anywhere, the builder stays **conservative**: version-gated features are treated as unavailable (the pre-existing behavior — nothing breaks). An invalid version string throws at construction.
 
 ## DDL Generation
 

@@ -68,6 +68,32 @@ class CQLFunction {
   }
 }
 
+// ─── Cassandra version gating ────────────────────────────────────────────────
+
+// Features whose validity depends on the server version. When no version is
+// configured the builder stays conservative and treats them as unavailable.
+const VERSION_FEATURES = {
+  // TTL/WRITETIME on non-frozen collections: 4.x rejects the selection
+  // outright, 5.0+ accepts it and returns a per-cell LIST
+  collectionCellMetadata: '5.0',
+};
+
+function parseCassandraVersion(version) {
+  if (typeof version !== 'string' || !/^\d+(\.\d+)*([-+~].*)?$/.test(version.trim())) {
+    throw new CQLBuildError(
+      `Invalid cassandraVersion "${version}" — expected a release string like "4.1" or "5.0.2"`
+    );
+  }
+  const [major, minor = '0'] = version.trim().split('.');
+  return { major: parseInt(major, 10), minor: parseInt(minor, 10) || 0 };
+}
+
+function versionAtLeast(version, minimum) {
+  const v = parseCassandraVersion(version);
+  const m = parseCassandraVersion(minimum);
+  return v.major > m.major || (v.major === m.major && v.minor >= m.minor);
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function escapeIdentifier(name) {
@@ -134,10 +160,11 @@ function guardSealed(builder, method) {
 // ─── SELECT Builder ──────────────────────────────────────────────────────────
 
 class SelectBuilder {
-  constructor(registry, keyspace, table) {
+  constructor(registry, keyspace, table, cassandraVersion = null) {
     this._registry = registry;
     this._keyspace = keyspace;
     this._table = table;
+    this._cassandraVersion = cassandraVersion;
     this._columns = [];
     this._metaProjections = [];
     this._where = [];
@@ -201,9 +228,18 @@ class SelectBuilder {
     }
     const type = this._registry.getColumnType(this._keyspace, this._table, column);
     if (/^(list|set|map)</i.test(type)) {
-      throw new CQLBuildError(
-        `Cannot select ${fn}("${column}") — non-frozen collections are multi-cell (freeze the column or select it plainly)`
-      );
+      // Non-frozen collections are multi-cell; only Cassandra 5.0+ can
+      // select their metadata (as a per-cell LIST) — opt in via version
+      const needed = VERSION_FEATURES.collectionCellMetadata;
+      if (!(this._cassandraVersion && versionAtLeast(this._cassandraVersion, needed))) {
+        throw new CQLBuildError(
+          `Cannot select ${fn}("${column}") — non-frozen collections are multi-cell; ` +
+          `per-cell metadata needs Cassandra ${needed}+ ` +
+          (this._cassandraVersion
+            ? `(target version is ${this._cassandraVersion})`
+            : `(no cassandraVersion configured — set it on the CQLBuilder or in the schema to opt in)`)
+        );
+      }
     }
     if (alias !== undefined && !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(alias)) {
       throw new CQLBuildError(`Invalid projection alias: "${alias}"`);
@@ -269,7 +305,7 @@ class SelectBuilder {
   }
 
   clone() {
-    const c = new SelectBuilder(this._registry, this._keyspace, this._table);
+    const c = new SelectBuilder(this._registry, this._keyspace, this._table, this._cassandraVersion);
     c._columns = [...this._columns];
     c._metaProjections = this._metaProjections.map(m => ({ ...m }));
     c._where = this._where.map(w => ({ ...w }));
@@ -945,15 +981,39 @@ class BatchBuilder {
 // ─── Main CQLBuilder entry point ─────────────────────────────────────────────
 
 class CQLBuilder {
-  constructor(registry) {
+  /**
+   * @param {SchemaRegistry} registry
+   * @param {object} [options]
+   * @param {string} [options.cassandraVersion] - Target server release, e.g.
+   *   "4.1" or "5.0.2". Enables version-gated features (see VERSION_FEATURES).
+   *   Precedence: this option > the schema's own `cassandra_version` field >
+   *   unknown (conservative). Auto-detect from a live cluster with
+   *   `LiveSchemaIntrospector.releaseVersion()`.
+   */
+  constructor(registry, options = {}) {
     if (!(registry instanceof SchemaRegistry)) {
       throw new Error('CQLBuilder requires a SchemaRegistry instance');
     }
     this._registry = registry;
+    this._cassandraVersion = options.cassandraVersion ?? null;
+    if (this._cassandraVersion !== null) {
+      parseCassandraVersion(this._cassandraVersion); // fail fast on garbage
+    }
+  }
+
+  // Explicit option wins; otherwise the keyspace's schema may declare its
+  // own target via a top-level `cassandra_version` field
+  _versionFor(keyspace) {
+    if (this._cassandraVersion) return this._cassandraVersion;
+    try {
+      return this._registry.get(keyspace)?.cassandra_version ?? null;
+    } catch {
+      return null;
+    }
   }
 
   select(keyspace, table) {
-    return new SelectBuilder(this._registry, keyspace, table);
+    return new SelectBuilder(this._registry, keyspace, table, this._versionFor(keyspace));
   }
 
   insert(keyspace, table) {
@@ -1112,4 +1172,12 @@ class CQLBuilder {
   }
 }
 
-module.exports = { CQLBuilder, CQLBuildError, CQLFunction, ALLOWED_CQL_FUNCTIONS };
+module.exports = {
+  CQLBuilder,
+  CQLBuildError,
+  CQLFunction,
+  ALLOWED_CQL_FUNCTIONS,
+  VERSION_FEATURES,
+  parseCassandraVersion,
+  versionAtLeast,
+};

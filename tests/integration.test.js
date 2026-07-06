@@ -14,7 +14,7 @@ const assert = require('node:assert/strict');
 const path = require('path');
 
 const { SchemaRegistry } = require('../src/SchemaRegistry');
-const { CQLBuilder, CQLFunction } = require('../src/CQLBuilder');
+const { CQLBuilder, CQLFunction, VERSION_FEATURES, versionAtLeast } = require('../src/CQLBuilder');
 const { DDLGenerator } = require('../src/DDLGenerator');
 const { MigrationDiffer } = require('../src/MigrationDiffer');
 const { LiveSchemaIntrospector } = require('../src/LiveSchemaIntrospector');
@@ -1299,28 +1299,49 @@ describe('Integration — real Cassandra', { timeout: 120_000 }, () => {
       );
     });
 
-    it('documents the deliberate guard: the builder rejects TTL on collections on EVERY server version', async (t) => {
+    it('version gate matches the server exactly: TTL on collections per detected release', async (t) => {
       if (skipIfNoDb(t)) return;
 
-      // Server behavior is version-dependent: Cassandra 4.x rejects
-      // TTL(collection) outright ("Cannot use selection function ttl on
-      // non-frozen collection"), Cassandra 5 accepts it and returns a LIST
-      // of per-cell TTLs. Neither is what a caller of .ttl() expects, so
-      // the builder rejects collections everywhere (raw CQL remains
-      // available for the per-cell form). Accept either server outcome —
-      // the builder's rejection is the invariant.
-      try {
-        await client.execute(
-          `SELECT TTL(tags) AS tags_ttl FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
-          [cassandra.types.Uuid.random()], { prepare: true }
+      // Cassandra 4.x rejects TTL(collection) outright, 5.0+ accepts it and
+      // returns a per-cell LIST. Detect the release and prove the builder's
+      // gate agrees with THIS server on both sides of the cutoff.
+      const version = await new LiveSchemaIntrospector(client).releaseVersion();
+      const versionAware = new CQLBuilder(registry, { cassandraVersion: version });
+      console.log(`    detected Cassandra ${version}`);
+
+      if (versionAtLeast(version, VERSION_FEATURES.collectionCellMetadata)) {
+        // 5.0+: the version-aware builder allows it AND the server executes it
+        const sel = versionAware.select(TEST_KEYSPACE, 'users')
+          .ttl('tags', 'tags_ttl')
+          .where('user_id', cassandra.types.Uuid.random())
+          .build();
+        const result = await client.execute(sel.cql, sel.params, { prepare: true });
+        assert.equal(result.rows.length, 0); // no row — the point is it EXECUTED
+      } else {
+        // 4.x: the version-aware builder rejects it AND so does the server
+        assert.throws(
+          () => versionAware.select(TEST_KEYSPACE, 'users').ttl('tags'),
+          /needs Cassandra/
         );
-        console.log('    server accepts TTL(collection) — per-cell list (Cassandra 5+)');
-      } catch (err) {
-        assert.match(err.message, /ttl on non-frozen collection/i);
-        console.log('    server rejects TTL(collection) (Cassandra 4.x)');
+        await assert.rejects(
+          client.execute(`SELECT TTL(tags) FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+            [cassandra.types.Uuid.random()], { prepare: true }),
+          /ttl on non-frozen collection/i
+        );
       }
 
+      // With no version configured the builder stays conservative everywhere
       assert.throws(() => cql.select(TEST_KEYSPACE, 'users').ttl('tags'), /multi-cell/);
+    });
+
+    it('releaseVersion() reports the server release from system.local', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const version = await new LiveSchemaIntrospector(client).releaseVersion();
+      assert.match(version, /^\d+\.\d+/);
+
+      const raw = await client.execute('SELECT release_version FROM system.local');
+      assert.equal(version, raw.rows[0].release_version);
     });
   });
 

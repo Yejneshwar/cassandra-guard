@@ -956,3 +956,116 @@ describe('validateRawCQL function projections', () => {
     assert.equal(result.valid, true);
   });
 });
+
+describe('version-aware validation', () => {
+  const { versionAtLeast, VERSION_FEATURES } = require('../src/CQLBuilder');
+
+  let registry;
+
+  beforeEach(() => {
+    registry = new SchemaRegistry();
+    registry.loadFromFile(path.join(__dirname, '..', 'schemas', 'ecommerce.json'));
+  });
+
+  describe('versionAtLeast', () => {
+    it('compares major.minor numerically', () => {
+      assert.equal(versionAtLeast('5.0', '5.0'), true);
+      assert.equal(versionAtLeast('5.0.2', '5.0'), true);
+      assert.equal(versionAtLeast('6.1', '5.0'), true);
+      assert.equal(versionAtLeast('4.1.9', '5.0'), false);
+      assert.equal(versionAtLeast('4.10', '4.9'), true); // not lexicographic
+    });
+
+    it('rejects garbage version strings', () => {
+      assert.throws(() => versionAtLeast('latest', '5.0'), CQLBuildError);
+      assert.throws(() => versionAtLeast('', '5.0'), CQLBuildError);
+    });
+  });
+
+  describe('CQLBuilder cassandraVersion option', () => {
+    it('fails fast on an invalid version at construction', () => {
+      assert.throws(() => new CQLBuilder(registry, { cassandraVersion: 'newest' }), CQLBuildError);
+    });
+
+    it('keeps rejecting collection TTL with no version configured (conservative default)', () => {
+      const cql = new CQLBuilder(registry);
+      assert.throws(
+        () => cql.select('ecommerce', 'users').ttl('tags'),
+        /no cassandraVersion configured/
+      );
+    });
+
+    it('rejects collection TTL when the target version is below the feature gate', () => {
+      const cql = new CQLBuilder(registry, { cassandraVersion: '4.1' });
+      assert.throws(
+        () => cql.select('ecommerce', 'users').ttl('tags'),
+        /needs Cassandra 5\.0\+.*target version is 4\.1/
+      );
+    });
+
+    it('allows collection TTL/WRITETIME on Cassandra 5.0+ (per-cell list)', () => {
+      const cql = new CQLBuilder(registry, { cassandraVersion: '5.0.2' });
+      const q = cql.select('ecommerce', 'users')
+        .ttl('tags', 'tags_ttl')
+        .writetime('tags')
+        .where('user_id', 'u')
+        .build();
+      assert.match(q.cql, /TTL\(tags\) AS tags_ttl, WRITETIME\(tags\)/);
+    });
+
+    it('still rejects primary key columns regardless of version', () => {
+      const cql = new CQLBuilder(registry, { cassandraVersion: '5.0' });
+      assert.throws(
+        () => cql.select('ecommerce', 'users').ttl('user_id'),
+        /primary key columns have no cell metadata/
+      );
+    });
+
+    it('clone() carries the version', () => {
+      const cql = new CQLBuilder(registry, { cassandraVersion: '5.0' });
+      const base = cql.select('ecommerce', 'users').ttl('tags');
+      const q = base.clone().where('user_id', 'u').build();
+      assert.match(q.cql, /TTL\(tags\)/);
+    });
+  });
+
+  describe('schema-declared cassandra_version', () => {
+    const V5_SCHEMA = {
+      keyspace: 'vfive',
+      cassandra_version: '5.0',
+      replication: { class: 'SimpleStrategy', replication_factor: 1 },
+      tables: {
+        things: {
+          columns: { id: 'uuid', labels: 'set<text>' },
+          partition_key: ['id'],
+          clustering_key: [],
+        },
+      },
+    };
+
+    it('the schema file can opt a keyspace into version-gated features', () => {
+      registry.register(V5_SCHEMA);
+      const cql = new CQLBuilder(registry);
+
+      // vfive declares 5.0 → allowed
+      const q = cql.select('vfive', 'things').ttl('labels').where('id', 'x').build();
+      assert.match(q.cql, /TTL\(labels\)/);
+
+      // ecommerce declares nothing → still conservative
+      assert.throws(() => cql.select('ecommerce', 'users').ttl('tags'), /no cassandraVersion configured/);
+    });
+
+    it('an explicit builder option overrides the schema declaration', () => {
+      registry.register(V5_SCHEMA);
+      const cql = new CQLBuilder(registry, { cassandraVersion: '4.1' });
+      assert.throws(
+        () => cql.select('vfive', 'things').ttl('labels'),
+        /target version is 4\.1/
+      );
+    });
+  });
+
+  it('VERSION_FEATURES documents the collection metadata gate', () => {
+    assert.equal(VERSION_FEATURES.collectionCellMetadata, '5.0');
+  });
+});

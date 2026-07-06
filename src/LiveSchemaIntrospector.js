@@ -15,6 +15,16 @@ class LiveSchemaIntrospector {
   }
 
   /**
+   * The server's release version from system.local (e.g. "4.1.9", "5.0.2").
+   * Feed it to `new CQLBuilder(registry, { cassandraVersion })` to enable
+   * version-gated features against exactly the cluster you're connected to.
+   */
+  async releaseVersion() {
+    const result = await this._client.execute('SELECT release_version FROM system.local');
+    return result.rows[0].release_version;
+  }
+
+  /**
    * Introspect a keyspace and return a normalized schema object.
    */
   async introspect(keyspace) {

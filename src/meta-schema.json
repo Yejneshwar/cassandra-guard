@@ -6,6 +6,7 @@
   "additionalProperties": false,
   "properties": {
     "keyspace": { "type": "string", "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$" },
+    "cassandra_version": { "type": "string", "pattern": "^\\d+(\\.\\d+)*([-+~].*)?$" },
     "replication": {
       "type": "object",
       "required": ["class"],
