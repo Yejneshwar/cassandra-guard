@@ -1213,4 +1213,205 @@ describe('Integration — real Cassandra', { timeout: 120_000 }, () => {
       assert.match(errors[0], new RegExp(`Type mismatch in UDT ${TEST_KEYSPACE}\\.address field "city": app expects int, but live has text`));
     });
   });
+
+  // ── SELECT TTL/WRITETIME projections ─────────────────────────────────────
+
+  describe('SELECT metadata projections (TTL/WRITETIME)', () => {
+    it('reads back the remaining TTL through .ttl() after an INSERT with TTL', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+
+      const ins = cql.insert(TEST_KEYSPACE, 'users')
+        .values({ user_id: id, email: 'ttl-proj@test.com', name: 'TTL Projection' })
+        .ttl(600)
+        .build();
+      await client.execute(ins.cql, ins.params, { prepare: true });
+
+      const sel = cql.select(TEST_KEYSPACE, 'users')
+        .columns('email')
+        .ttl('email', 'email_ttl')
+        .where('user_id', id)
+        .build();
+      const result = await client.execute(sel.cql, sel.params, { prepare: true });
+
+      assert.equal(result.rows[0].email, 'ttl-proj@test.com');
+      assert.ok(result.rows[0].email_ttl > 0, 'remaining TTL should be positive');
+      assert.ok(result.rows[0].email_ttl <= 600, 'remaining TTL cannot exceed the insert TTL');
+
+      // Cleanup
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+
+    it('projects a null TTL for a cell written without one', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+
+      const ins = cql.insert(TEST_KEYSPACE, 'users')
+        .values({ user_id: id, email: 'no-ttl@test.com', name: 'No TTL' })
+        .build();
+      await client.execute(ins.cql, ins.params, { prepare: true });
+
+      const sel = cql.select(TEST_KEYSPACE, 'users')
+        .ttl('email', 'email_ttl')
+        .where('user_id', id)
+        .build();
+      const result = await client.execute(sel.cql, sel.params, { prepare: true });
+
+      assert.equal(result.rows[0].email_ttl, null);
+
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+
+    it('reads the write timestamp through .writetime()', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+      const beforeMicros = Date.now() * 1000;
+
+      const ins = cql.insert(TEST_KEYSPACE, 'users')
+        .values({ user_id: id, email: 'wt@test.com', name: 'Writetime' })
+        .build();
+      await client.execute(ins.cql, ins.params, { prepare: true });
+
+      const sel = cql.select(TEST_KEYSPACE, 'users')
+        .writetime('email', 'wt')
+        .where('user_id', id)
+        .build();
+      const result = await client.execute(sel.cql, sel.params, { prepare: true });
+
+      // WRITETIME is microseconds since epoch (driver returns a Long)
+      const wt = Number(result.rows[0].wt.toString());
+      assert.ok(wt >= beforeMicros - 60_000_000, 'writetime should be around now');
+
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+
+    it('the guard rules mirror the server: TTL on a primary key column is rejected by Cassandra too', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      // The builder throws for .ttl('user_id') — prove the server agrees
+      await assert.rejects(
+        client.execute(`SELECT TTL(user_id) FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+          [cassandra.types.Uuid.random()], { prepare: true }),
+        /(PRIMARY KEY|primary key)/i
+      );
+    });
+
+    it('documents the deliberate guard: modern Cassandra ALLOWS TTL on collections (per-cell list), the builder still rejects it', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      // Since Cassandra 4.1, TTL(collection) is legal and returns a LIST of
+      // per-cell TTLs — almost never what a caller of .ttl() expects, so the
+      // builder keeps rejecting it (single-cell projections only). Raw CQL
+      // remains available for the per-cell form; pin the server behavior so
+      // a future change is noticed.
+      const result = await client.execute(
+        `SELECT TTL(tags) AS tags_ttl FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [cassandra.types.Uuid.random()], { prepare: true }
+      );
+      assert.equal(result.rows.length, 0); // no row — the point is it PREPARED
+
+      assert.throws(() => cql.select(TEST_KEYSPACE, 'users').ttl('tags'), /multi-cell/);
+    });
+  });
+
+  // ── DELETE element removal ────────────────────────────────────────────────
+
+  describe('DELETE element removal', () => {
+    it('removes a single map entry and leaves the rest', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+
+      const ins = cql.insert(TEST_KEYSPACE, 'users')
+        .values({
+          user_id: id,
+          email: 'map-del@test.com',
+          name: 'Map Delete',
+          preferences: { theme: 'dark', lang: 'en' },
+        })
+        .build();
+      await client.execute(ins.cql, ins.params, { prepare: true });
+
+      const del = cql.delete(TEST_KEYSPACE, 'users')
+        .element('preferences', 'theme')
+        .where('user_id', id)
+        .build();
+      await client.execute(del.cql, del.params, { prepare: true });
+
+      const result = await client.execute(
+        `SELECT preferences FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [id], { prepare: true }
+      );
+      assert.deepEqual(result.rows[0].preferences, { lang: 'en' });
+
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+
+    it('removes a single list element by index and reindexes the rest', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+      const orderId = cassandra.types.TimeUuid.now();
+
+      const ins = cql.insert(TEST_KEYSPACE, 'orders_by_user')
+        .values({
+          user_id: id,
+          order_id: orderId,
+          status: 'pending',
+          items: ['alpha', 'beta', 'gamma'],
+        })
+        .build();
+      await client.execute(ins.cql, ins.params, { prepare: true });
+
+      const del = cql.delete(TEST_KEYSPACE, 'orders_by_user')
+        .element('items', 1)
+        .where('user_id', id)
+        .where('order_id', orderId)
+        .build();
+      await client.execute(del.cql, del.params, { prepare: true });
+
+      const result = await client.execute(
+        `SELECT items FROM ${TEST_KEYSPACE}.orders_by_user WHERE user_id = ? AND order_id = ?`,
+        [id, orderId], { prepare: true }
+      );
+      assert.deepEqual(result.rows[0].items, ['alpha', 'gamma']);
+
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.orders_by_user WHERE user_id = ?`, [id], { prepare: true });
+    });
+
+    it('mixes a whole-column delete with an element delete in one statement', async (t) => {
+      if (skipIfNoDb(t)) return;
+
+      const id = cassandra.types.Uuid.random();
+
+      const ins = cql.insert(TEST_KEYSPACE, 'users')
+        .values({
+          user_id: id,
+          email: 'mixed-del@test.com',
+          name: 'Mixed Delete',
+          preferences: { theme: 'dark', lang: 'en' },
+        })
+        .build();
+      await client.execute(ins.cql, ins.params, { prepare: true });
+
+      const del = cql.delete(TEST_KEYSPACE, 'users')
+        .columns('name')
+        .element('preferences', 'lang')
+        .where('user_id', id)
+        .build();
+      await client.execute(del.cql, del.params, { prepare: true });
+
+      const result = await client.execute(
+        `SELECT name, preferences FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`,
+        [id], { prepare: true }
+      );
+      assert.equal(result.rows[0].name, null);
+      assert.deepEqual(result.rows[0].preferences, { theme: 'dark' });
+
+      await client.execute(`DELETE FROM ${TEST_KEYSPACE}.users WHERE user_id = ?`, [id], { prepare: true });
+    });
+  });
 });

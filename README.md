@@ -105,6 +105,8 @@ Columns can be strings (`"uuid"`) or objects for more detail:
 ```javascript
 cql.select('ks', 'table')
   .columns('col1', 'col2')       // validated against schema
+  .ttl('col2', 'expires_at')     // TTL(col2) AS expires_at — regular single-cell columns only
+  .writetime('col2')             // WRITETIME(col2)
   .where('pk_col', value)         // = operator
   .where('ck_col', '>', value)    // comparison operators
   .where('pk_col', 'IN', [a, b]) // IN queries
@@ -112,9 +114,11 @@ cql.select('ks', 'table')
   .limit(100)
   .perPartitionLimit(10)
   .allowFiltering()
-  .distinct()
+  .distinct()                    // cannot be combined with ttl()/writetime()
   .build();
 ```
+
+> **TTL/WRITETIME projections:** `.ttl(column, alias?)` and `.writetime(column, alias?)` validate that the column exists, is not part of the primary key (key columns have no cell metadata), and is not a non-frozen collection (multi-cell).
 
 ### INSERT
 
@@ -152,13 +156,16 @@ cql.update('ks', 'table')
 
 ```javascript
 cql.delete('ks', 'table')
-  .columns('col1', 'col2')  // optional: specific columns
+  .columns('col1', 'col2')      // optional: specific columns
+  .element('map_col', 'key')    // DELETE map_col[?] — map key or list index
   .where('pk_col', value)
   .if_('col', 'expected')
   .ifExists()
   .timestamp(ts)
   .build();
 ```
+
+> **Element deletion:** `.element(column, key)` validates that the column is a non-frozen `map<...>` or `list<...>`. Sets are rejected — CQL has no set element deletion; remove by value with `UPDATE ... removeFromSet()` instead. Element keys bind in statement order, before the WHERE params.
 
 ### BATCH
 
@@ -219,6 +226,8 @@ Allowed functions include: `now`, `uuid`, `toTimestamp`, `toDate`, `toUnixTimest
 | Counter ops only on counter columns | UPDATE increment/decrement |
 | UDT field exists and column is non-frozen | UPDATE setField |
 | Server-side function is whitelisted | INSERT/UPDATE values using CQLBuilder.fn() |
+| TTL/WRITETIME only on regular single-cell columns | SELECT ttl()/writetime() |
+| Element deletion only on non-frozen map/list columns | DELETE element() |
 
 ## DDL Generation
 
@@ -293,6 +302,11 @@ Validate hand-written CQL against the schema:
 ```javascript
 const result = cql.validateRawCQL('SELECT user_id, fake_col FROM ecommerce.users');
 // → { valid: false, errors: ['Column "fake_col" not found in ecommerce.users'] }
+
+// Function projections are understood: the wrapped column is validated,
+// aliases are ignored, and commas inside argument lists don't confuse it
+cql.validateRawCQL('SELECT order_id, TTL(created_at) AS expires_at FROM ecommerce.orders_by_user');
+// → { valid: true, errors: [] }
 ```
 
 ## CLI

@@ -780,3 +780,179 @@ describe('CQLBuilder', () => {
     });
   });
 });
+
+// ─── TTL/WRITETIME projections + element deletion + raw projection parsing ──
+
+describe('SELECT metadata projections (TTL/WRITETIME)', () => {
+  let registry;
+  let cql;
+
+  beforeEach(() => {
+    registry = new SchemaRegistry();
+    registry.loadFromFile(path.join(__dirname, '..', 'schemas', 'ecommerce.json'));
+    cql = new CQLBuilder(registry);
+  });
+
+  it('projects TTL with an alias alongside plain columns', () => {
+    const q = cql.select('ecommerce', 'orders_by_user')
+      .columns('order_id')
+      .ttl('created_at', 'expires_at')
+      .where('user_id', 'uid-1')
+      .build();
+    assert.equal(
+      q.cql,
+      'SELECT order_id, TTL(created_at) AS expires_at FROM ecommerce.orders_by_user WHERE user_id = ?'
+    );
+    assert.deepEqual(q.params, ['uid-1']);
+  });
+
+  it('projects WRITETIME without an alias', () => {
+    const q = cql.select('ecommerce', 'users')
+      .writetime('email')
+      .where('user_id', 'uid-1')
+      .build();
+    assert.equal(q.cql, 'SELECT WRITETIME(email) FROM ecommerce.users WHERE user_id = ?');
+  });
+
+  it('rejects TTL on a primary key column', () => {
+    assert.throws(
+      () => cql.select('ecommerce', 'orders_by_user').ttl('order_id'),
+      /primary key columns have no cell metadata/
+    );
+  });
+
+  it('rejects TTL on a non-frozen collection', () => {
+    assert.throws(
+      () => cql.select('ecommerce', 'users').ttl('tags'),
+      /multi-cell/
+    );
+  });
+
+  it('rejects an unknown column', () => {
+    assert.throws(
+      () => cql.select('ecommerce', 'users').ttl('nonexistent'),
+      CQLBuildError
+    );
+  });
+
+  it('rejects a malformed alias', () => {
+    assert.throws(
+      () => cql.select('ecommerce', 'users').ttl('email', 'bad alias; DROP'),
+      /Invalid projection alias/
+    );
+  });
+
+  it('rejects DISTINCT combined with metadata projections', () => {
+    assert.throws(
+      () => cql.select('ecommerce', 'users').distinct().ttl('email').build(),
+      /DISTINCT cannot be combined/
+    );
+  });
+
+  it('clone() carries metadata projections', () => {
+    const base = cql.select('ecommerce', 'users').ttl('email', 'e');
+    const q = base.clone().where('user_id', 'u').build();
+    assert.match(q.cql, /TTL\(email\) AS e/);
+  });
+});
+
+describe('DELETE element removal', () => {
+  let registry;
+  let cql;
+
+  beforeEach(() => {
+    registry = new SchemaRegistry();
+    registry.loadFromFile(path.join(__dirname, '..', 'schemas', 'ecommerce.json'));
+    cql = new CQLBuilder(registry);
+  });
+
+  it('deletes a map entry by key', () => {
+    const q = cql.delete('ecommerce', 'users')
+      .element('preferences', 'theme')
+      .where('user_id', 'uid-1')
+      .build();
+    assert.equal(q.cql, 'DELETE preferences[?] FROM ecommerce.users WHERE user_id = ?');
+    assert.deepEqual(q.params, ['theme', 'uid-1']);
+  });
+
+  it('deletes a list element by index', () => {
+    const q = cql.delete('ecommerce', 'orders_by_user')
+      .element('items', 0)
+      .where('user_id', 'uid-1')
+      .where('order_id', 'tuuid-1')
+      .build();
+    assert.equal(q.cql, 'DELETE items[?] FROM ecommerce.orders_by_user WHERE user_id = ? AND order_id = ?');
+    assert.deepEqual(q.params, [0, 'uid-1', 'tuuid-1']);
+  });
+
+  it('mixes whole-column and element deletes, element keys bind first in statement order', () => {
+    const q = cql.delete('ecommerce', 'users')
+      .columns('name')
+      .element('preferences', 'theme')
+      .where('user_id', 'uid-1')
+      .build();
+    assert.equal(q.cql, 'DELETE name, preferences[?] FROM ecommerce.users WHERE user_id = ?');
+    assert.deepEqual(q.params, ['theme', 'uid-1']);
+  });
+
+  it('rejects element deletion on a set (CQL has no set element deletion)', () => {
+    assert.throws(
+      () => cql.delete('ecommerce', 'users').element('tags', 'vip'),
+      /needs a non-frozen map or list/
+    );
+  });
+
+  it('rejects element deletion on a scalar column', () => {
+    assert.throws(
+      () => cql.delete('ecommerce', 'users').element('email', 'x'),
+      /needs a non-frozen map or list/
+    );
+  });
+
+  it('clone() carries element deletions', () => {
+    const base = cql.delete('ecommerce', 'users').element('preferences', 'theme');
+    const q = base.clone().where('user_id', 'u').build();
+    assert.match(q.cql, /preferences\[\?\]/);
+  });
+});
+
+describe('validateRawCQL function projections', () => {
+  let registry;
+  let cql;
+
+  beforeEach(() => {
+    registry = new SchemaRegistry();
+    registry.loadFromFile(path.join(__dirname, '..', 'schemas', 'ecommerce.json'));
+    cql = new CQLBuilder(registry);
+  });
+
+  it('accepts TTL(...) AS alias projections on known columns', () => {
+    const result = cql.validateRawCQL(
+      'SELECT order_id,TTL(created_at) AS expires_at FROM ecommerce.orders_by_user WHERE user_id = ?'
+    );
+    assert.deepEqual(result, { valid: true, errors: [] });
+  });
+
+  it('accepts COUNT(*) and aliased plain columns', () => {
+    const result = cql.validateRawCQL(
+      'SELECT COUNT(*), email AS contact FROM ecommerce.users'
+    );
+    assert.equal(result.valid, true);
+  });
+
+  it('still flags an unknown column inside a function projection', () => {
+    const result = cql.validateRawCQL(
+      'SELECT TTL(fake_col) FROM ecommerce.users'
+    );
+    assert.equal(result.valid, false);
+    assert.match(result.errors[0], /fake_col/);
+  });
+
+  it('does not split on commas inside function arguments', () => {
+    const result = cql.validateRawCQL(
+      'SELECT minTimeuuid(created_at, email) FROM ecommerce.users'
+    );
+    // multi-arg functions are beyond raw validation but must not false-positive
+    assert.equal(result.valid, true);
+  });
+});

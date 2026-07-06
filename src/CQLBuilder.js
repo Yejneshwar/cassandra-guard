@@ -77,6 +77,28 @@ function escapeIdentifier(name) {
 
 const COMPARISON_OPS = ['=', '!=', '<', '>', '<=', '>=', 'IN', 'CONTAINS', 'CONTAINS KEY'];
 
+/**
+ * Split a SELECT projection list on top-level commas only — commas inside
+ * function parentheses (e.g. "minTimeuuid(a, b)") don't split.
+ */
+function splitProjections(s) {
+  const parts = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of s) {
+    if (ch === '(') depth++;
+    if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      parts.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim() !== '') parts.push(current);
+  return parts.map(p => p.trim());
+}
+
 function buildWhereClause(conditions) {
   if (!conditions || conditions.length === 0) return { cql: '', params: [] };
   const parts = [];
@@ -117,6 +139,7 @@ class SelectBuilder {
     this._keyspace = keyspace;
     this._table = table;
     this._columns = [];
+    this._metaProjections = [];
     this._where = [];
     this._orderBy = [];
     this._limit = null;
@@ -142,6 +165,50 @@ class SelectBuilder {
     guardSealed(this, 'distinct');
     this._distinct = true;
     return this;
+  }
+
+  /**
+   * Project TTL(column) — the remaining time-to-live of the cell.
+   * @param {string} column - A regular (non-key, single-cell) column
+   * @param {string} [alias] - Optional `AS alias` for the projection
+   */
+  ttl(column, alias) {
+    guardSealed(this, 'ttl');
+    this._addMetaProjection('TTL', column, alias);
+    return this;
+  }
+
+  /**
+   * Project WRITETIME(column) — the write timestamp of the cell.
+   * @param {string} column - A regular (non-key, single-cell) column
+   * @param {string} [alias] - Optional `AS alias` for the projection
+   */
+  writetime(column, alias) {
+    guardSealed(this, 'writetime');
+    this._addMetaProjection('WRITETIME', column, alias);
+    return this;
+  }
+
+  _addMetaProjection(fn, column, alias) {
+    this._validateColumn(column);
+    // Cassandra rejects TTL/WRITETIME on primary key columns (they have no
+    // independent cells) and on non-frozen collections (multi-cell)
+    const pk = this._registry.getPrimaryKey(this._keyspace, this._table);
+    if (pk.includes(column)) {
+      throw new CQLBuildError(
+        `Cannot select ${fn}("${column}") — primary key columns have no cell metadata`
+      );
+    }
+    const type = this._registry.getColumnType(this._keyspace, this._table, column);
+    if (/^(list|set|map)</i.test(type)) {
+      throw new CQLBuildError(
+        `Cannot select ${fn}("${column}") — non-frozen collections are multi-cell (freeze the column or select it plainly)`
+      );
+    }
+    if (alias !== undefined && !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(alias)) {
+      throw new CQLBuildError(`Invalid projection alias: "${alias}"`);
+    }
+    this._metaProjections.push({ fn, column, alias });
   }
 
   where(column, opOrValue, value) {
@@ -204,6 +271,7 @@ class SelectBuilder {
   clone() {
     const c = new SelectBuilder(this._registry, this._keyspace, this._table);
     c._columns = [...this._columns];
+    c._metaProjections = this._metaProjections.map(m => ({ ...m }));
     c._where = this._where.map(w => ({ ...w }));
     c._orderBy = this._orderBy.map(o => ({ ...o }));
     c._limit = this._limit;
@@ -216,8 +284,18 @@ class SelectBuilder {
   build() {
     guardSealed(this, 'build');
 
-    const selectCols = this._columns.length > 0
-      ? this._columns.map(escapeIdentifier).join(', ')
+    if (this._distinct && this._metaProjections.length > 0) {
+      throw new CQLBuildError('SELECT DISTINCT cannot be combined with TTL/WRITETIME projections');
+    }
+
+    const projectionParts = this._columns.map(escapeIdentifier);
+    for (const m of this._metaProjections) {
+      projectionParts.push(
+        `${m.fn}(${escapeIdentifier(m.column)})${m.alias ? ` AS ${escapeIdentifier(m.alias)}` : ''}`
+      );
+    }
+    const selectCols = projectionParts.length > 0
+      ? projectionParts.join(', ')
       : '*';
 
     const distinct = this._distinct ? 'DISTINCT ' : '';
@@ -666,6 +744,7 @@ class DeleteBuilder {
     this._keyspace = keyspace;
     this._table = table;
     this._columns = [];
+    this._elements = [];
     this._where = [];
     this._ifs = [];
     this._ifExists = false;
@@ -682,6 +761,26 @@ class DeleteBuilder {
       this._validateColumn(c);
     }
     this._columns = flat;
+    return this;
+  }
+
+  /**
+   * Delete a single element of a collection: DELETE col[?] FROM ...
+   * Maps take the key, lists take the index. Sets are rejected (CQL has no
+   * element deletion for sets — remove by value with UPDATE removeFromSet).
+   * @param {string} column - A non-frozen map or list column
+   * @param {*} key - The map key (or list index) to remove
+   */
+  element(column, key) {
+    guardSealed(this, 'element');
+    this._validateColumn(column);
+    const type = this._registry.getColumnType(this._keyspace, this._table, column);
+    if (!/^(map|list)</i.test(type)) {
+      throw new CQLBuildError(
+        `Cannot delete an element of "${column}" (${type}) — element deletion needs a non-frozen map or list`
+      );
+    }
+    this._elements.push({ column, key });
     return this;
   }
 
@@ -722,6 +821,7 @@ class DeleteBuilder {
   clone() {
     const c = new DeleteBuilder(this._registry, this._keyspace, this._table);
     c._columns = [...this._columns];
+    c._elements = this._elements.map(e => ({ ...e }));
     c._where = this._where.map(w => ({ ...w }));
     c._ifs = this._ifs.map(i => ({ ...i }));
     c._ifExists = this._ifExists;
@@ -737,9 +837,13 @@ class DeleteBuilder {
     }
 
     const params = [];
-    const deleteCols = this._columns.length > 0
-      ? this._columns.map(escapeIdentifier).join(', ') + ' '
-      : '';
+    const targets = [
+      ...this._columns.map(escapeIdentifier),
+      ...this._elements.map(e => `${escapeIdentifier(e.column)}[?]`),
+    ];
+    const deleteCols = targets.length > 0 ? targets.join(', ') + ' ' : '';
+    // element keys bind in statement order — before the WHERE params
+    params.push(...this._elements.map(e => e.key));
 
     let cql = `DELETE ${deleteCols}FROM ${escapeIdentifier(this._keyspace)}.${escapeIdentifier(this._table)}`;
 
@@ -919,11 +1023,26 @@ class CQLBuilder {
     try {
       const tableDef = this._registry.getTable(tableRef.keyspace, tableRef.table);
       if (colsPart !== '*') {
-        const cols = colsPart.split(',').map(c => c.trim().replace(/"/g, ''));
-        for (const c of cols) {
+        for (let c of splitProjections(colsPart)) {
+          // strip DISTINCT prefix and a trailing AS alias
+          c = c.replace(/^DISTINCT\s+/i, '').replace(/\s+AS\s+[a-zA-Z_"][a-zA-Z0-9_"]*\s*$/i, '').trim();
           if (c === '' || c.toUpperCase() === 'DISTINCT') continue;
-          if (!(c in tableDef.columns)) {
-            errors.push(`Column "${c}" not found in ${tableRef.keyspace}.${tableRef.table}`);
+
+          // function projection — TTL(col), WRITETIME(col), COUNT(*), ... :
+          // validate the argument when it is a plain column reference,
+          // anything nested/complex is beyond raw validation
+          const fnMatch = c.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)\)$/);
+          if (fnMatch) {
+            const inner = fnMatch[2].trim().replace(/"/g, '');
+            if (/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(inner) && !(inner in tableDef.columns)) {
+              errors.push(`Column "${inner}" not found in ${tableRef.keyspace}.${tableRef.table}`);
+            }
+            continue;
+          }
+
+          const bare = c.replace(/"/g, '');
+          if (!(bare in tableDef.columns)) {
+            errors.push(`Column "${bare}" not found in ${tableRef.keyspace}.${tableRef.table}`);
           }
         }
       }
