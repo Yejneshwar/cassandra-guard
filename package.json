@@ -41,7 +41,7 @@
   ],
   "scripts": {
     "test": "node --test tests/**/*.test.js",
-    "test:unit": "node --test tests/CQLBuilder.test.js tests/DDLAndMigration.test.js tests/SchemaRegistry.test.js",
+    "test:unit": "node --test tests/CQLBuilder.test.js tests/CompatibilityChecker.test.js tests/DDLAndMigration.test.js tests/SchemaRegistry.test.js tests/connection.test.js",
     "test:integration": "node --test tests/integration.test.js",
     "docker:up": "node -e \"require('child_process').execSync(process.platform==='win32'?'powershell -File scripts/cassandra-up.ps1':'bash scripts/cassandra-up.sh',{stdio:'inherit'})\"",
     "docker:down": "node -e \"require('child_process').execSync(process.platform==='win32'?'powershell -File scripts/cassandra-down.ps1':'bash scripts/cassandra-down.sh',{stdio:'inherit'})\"",

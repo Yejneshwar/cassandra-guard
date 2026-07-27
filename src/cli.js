@@ -9,13 +9,16 @@ const { DDLGenerator } = require('./DDLGenerator');
 const { MigrationDiffer } = require('./MigrationDiffer');
 const { LiveSchemaIntrospector } = require('./LiveSchemaIntrospector');
 const { CompatibilityChecker } = require('./CompatibilityChecker');
+const { addConnectionOptions, connect, ConnectionError } = require('./connection');
 
 const program = new Command();
 
 program
   .name('csg')
   .description('Cassandra Schema Guard — schema registry, CQL builder, and migration tool')
-  .version('1.0.0');
+  // Read from package.json rather than repeating it here: the hardcoded literal
+  // had drifted to 1.0.0 while the package was at 2.3.0.
+  .version(require('../package.json').version);
 
 // ── validate ──
 program
@@ -147,35 +150,26 @@ program
   });
 
 // ── diff-live ──
-program
-  .command('diff-live')
-  .description('Diff a schema JSON against a live Cassandra cluster')
-  .argument('<schema-file>', 'Path to target schema JSON')
-  .option('-h, --host <host>', 'Cassandra host', 'localhost')
-  .option('-p, --port <port>', 'Cassandra port', '9042')
-  .option('--datacenter <dc>', 'Local datacenter name', 'datacenter1')
-  .option('--user <user>', 'Cassandra Username', null)
-  .option('--pass <pass>', 'Cassandra Password', null)
+addConnectionOptions(
+  program
+    .command('diff-live')
+    .description('Diff a schema JSON against a live Cassandra cluster')
+    .argument('<schema-file>', 'Path to target schema JSON')
+)
   .option('-o, --output <file>', 'Write migration to file')
   .action(async (schemaFile, opts) => {
     let client;
     try {
-      const cassandra = require('cassandra-driver');
-      const authProvider = new cassandra.auth.PlainTextAuthProvider(
-        opts.user,
-        opts.pass
-      )
-      client = new cassandra.Client({
-        contactPoints: [opts.host],
-        localDataCenter: opts.datacenter,
-        protocolOptions: { port: parseInt(opts.port) },
-        authProvider: (opts.user ? authProvider : null)
-      });
-
-      await client.connect().catch((e) => {
-        console.error(`Error connecting to Cassandra: ${e.message}`);
+      try {
+        client = await connect(opts);
+      } catch (e) {
+        if (e instanceof ConnectionError) {
+          console.error(`Configuration error: ${e.message}`);
+        } else {
+          console.error(`Error connecting to Cassandra: ${e.message}`);
+        }
         process.exit(1);
-      });
+      }
 
       const registry = new SchemaRegistry();
       const ks = registry.loadFromFile(schemaFile);
@@ -224,34 +218,27 @@ program
   });
 
 // ── check-live ──
-program
-  .command('check-live')
-  .description('Check if a live Cassandra cluster is compatible with a schema JSON')
-  .argument('<schema-file>', 'Path to target schema JSON')
-  .option('-h, --host <host>', 'Cassandra host', 'localhost')
-  .option('-p, --port <port>', 'Cassandra port', '9042')
-  .option('--datacenter <dc>', 'Local datacenter name', 'datacenter1')
-  .option('--user <user>', 'Cassandra Username', null)
-  .option('--pass <pass>', 'Cassandra Password', null)
+addConnectionOptions(
+  program
+    .command('check-live')
+    .description('Check if a live Cassandra cluster is compatible with a schema JSON')
+    .argument('<schema-file>', 'Path to target schema JSON')
+)
   .action(async (schemaFile, opts) => {
     let client;
     try {
-      const cassandra = require('cassandra-driver');
-      const authProvider = new cassandra.auth.PlainTextAuthProvider(
-        opts.user,
-        opts.pass
-      );
-      client = new cassandra.Client({
-        contactPoints: [opts.host],
-        localDataCenter: opts.datacenter,
-        protocolOptions: { port: parseInt(opts.port) },
-        authProvider: (opts.user ? authProvider : null)
-      });
-
-      await client.connect().catch((e) => {
-        console.error(`Error connecting to Cassandra: ${e.message}`);
+      try {
+        client = await connect(opts);
+      } catch (e) {
+        // A misconfiguration and a genuinely unreachable cluster need different
+        // responses, so do not report them the same way.
+        if (e instanceof ConnectionError) {
+          console.error(`Configuration error: ${e.message}`);
+        } else {
+          console.error(`Error connecting to Cassandra: ${e.message}`);
+        }
         process.exit(1);
-      });
+      }
 
       const registry = new SchemaRegistry();
       const ks = registry.loadFromFile(schemaFile);
