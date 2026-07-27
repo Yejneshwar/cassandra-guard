@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.0.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v2.3.0...cassandra-guard-v3.0.0) (2026-07-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* update db auth handling
+
+### Features
+
+* update db auth handling ([c260bb2](https://github.com/Yejneshwar/cassandra-guard/commit/c260bb2e4ac777dbc36c685421c2ed5451d367ec))
+
 ## [2.3.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v2.2.0...cassandra-guard-v2.3.0) (2026-07-06)
 
 
