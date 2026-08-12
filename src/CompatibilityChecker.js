@@ -1,5 +1,37 @@
 class CompatibilityChecker {
   /**
+   * Normalize a UDT FIELD type for comparison: strip `frozen<...>` wrappers
+   * around known UDT names, anywhere in the type string.
+   *
+   * Everything nested inside a UDT is implicitly frozen — Cassandra only
+   * permits non-frozen UDTs as top-level column types — so `mapbounds` and
+   * `frozen<mapbounds>` describe the SAME field. Which spelling
+   * system_schema reports depends on how the type was originally DECLARED
+   * (a legacy CREATE TYPE without the frozen keyword reads back bare; one
+   * created from a frozen<> declaration reads back wrapped), so a literal
+   * string comparison manufactures incompatibilities between semantically
+   * identical schemas — and there is no ALTER that could ever "fix" them.
+   *
+   * Deliberately applied ONLY to UDT fields: on table COLUMNS, frozen vs
+   * non-frozen UDT is a real semantic difference and stays strict.
+   *
+   * @param {string} type - The field type string.
+   * @param {Set<string>} udtNames - Known UDT names (app + live).
+   * @returns {string}
+   */
+  normalizeUdtFieldType(type, udtNames) {
+    let out = String(type);
+    let prev;
+    do {
+      prev = out;
+      for (const name of udtNames) {
+        out = out.split(`frozen<${name}>`).join(name);
+      }
+    } while (out !== prev);
+    return out;
+  }
+
+  /**
    * Check if the live database schema can support the application schema.
    * Returns an array of incompatibility error messages.
    * Empty array means fully compatible.
@@ -20,6 +52,7 @@ class CompatibilityChecker {
     // 1. Check UDTs
     const liveTypes = liveSchema.types || {};
     const appTypes = appSchema.types || {};
+    const udtNames = new Set([...Object.keys(appTypes), ...Object.keys(liveTypes)]);
 
     for (const [typeName, appTypeDef] of Object.entries(appTypes)) {
       if (!(typeName in liveTypes)) {
@@ -31,7 +64,10 @@ class CompatibilityChecker {
       for (const [fieldName, fieldType] of Object.entries(appTypeDef.fields)) {
         if (!(fieldName in liveTypeDef.fields)) {
           errors.push(`Missing UDT field: ${ks}.${typeName}.${fieldName}`);
-        } else if (liveTypeDef.fields[fieldName] !== fieldType) {
+        } else if (
+          this.normalizeUdtFieldType(liveTypeDef.fields[fieldName], udtNames) !==
+          this.normalizeUdtFieldType(fieldType, udtNames)
+        ) {
           errors.push(`Type mismatch in UDT ${ks}.${typeName} field "${fieldName}": app expects ${fieldType}, but live has ${liveTypeDef.fields[fieldName]}`);
         }
       }

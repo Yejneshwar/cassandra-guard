@@ -141,3 +141,68 @@ describe('CompatibilityChecker', () => {
     assert.match(errors[0], /Type mismatch in UDT/);
   });
 });
+
+describe('CompatibilityChecker nested-UDT frozen normalization', () => {
+  const checker = new CompatibilityChecker();
+
+  // Everything nested inside a UDT is implicitly frozen (non-frozen UDTs are
+  // only legal as top-level columns), and system_schema reports the spelling
+  // the type was DECLARED with — so a legacy `CREATE TYPE` without frozen<>
+  // reads back bare while a frozen<> declaration reads back wrapped. Both
+  // describe the same schema and no ALTER can convert between them.
+  const appSchema = {
+    keyspace: 'cube_user_addresses',
+    types: {
+      iso: { fields: { country_alpha_2: 'text' } },
+      mapbounds: { fields: { north: 'float' } },
+      metadata: { fields: { lat: 'float', mapbounds: 'frozen<mapbounds>', iso: 'frozen<iso>' } },
+      user_address_v2: { fields: { a_id: 'uuid', metadata: 'frozen<metadata>' } },
+      item: { fields: { sku: 'text' } },
+      order_info: { fields: { items: 'map<uuid, frozen<item>>' } }
+    },
+    tables: {
+      addresses: {
+        columns: { a_id: { type: 'uuid' }, addr: { type: 'frozen<user_address_v2>' } },
+        partition_key: ['a_id'],
+        clustering_key: []
+      }
+    }
+  };
+
+  it('treats bare and frozen<> nested UDT fields as identical (legacy-declared live schema)', () => {
+    const liveSchema = JSON.parse(JSON.stringify(appSchema));
+    liveSchema.types.metadata.fields.mapbounds = 'mapbounds';
+    liveSchema.types.metadata.fields.iso = 'iso';
+    liveSchema.types.user_address_v2.fields.metadata = 'metadata';
+    assert.deepEqual(checker.check(liveSchema, appSchema), []);
+  });
+
+  it('normalizes in both directions (frozen-declared live vs bare app)', () => {
+    const liveSchema = JSON.parse(JSON.stringify(appSchema));
+    const bareApp = JSON.parse(JSON.stringify(appSchema));
+    bareApp.types.metadata.fields.mapbounds = 'mapbounds';
+    assert.deepEqual(checker.check(liveSchema, bareApp), []);
+  });
+
+  it('normalizes UDTs nested inside collection generics within UDT fields', () => {
+    const liveSchema = JSON.parse(JSON.stringify(appSchema));
+    liveSchema.types.order_info.fields.items = 'map<uuid, item>';
+    assert.deepEqual(checker.check(liveSchema, appSchema), []);
+  });
+
+  it('still flags REAL UDT field type mismatches', () => {
+    const liveSchema = JSON.parse(JSON.stringify(appSchema));
+    liveSchema.types.metadata.fields.lat = 'double';
+    const errors = checker.check(liveSchema, appSchema);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Type mismatch in UDT .*metadata field "lat"/);
+  });
+
+  it('does NOT normalize table columns — top-level frozen-ness is a real difference', () => {
+    const liveSchema = JSON.parse(JSON.stringify(appSchema));
+    liveSchema.tables.addresses.columns.addr = { type: 'user_address_v2' };
+    const errors = checker.check(liveSchema, appSchema);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Type mismatch in column .*addr/);
+  });
+});
