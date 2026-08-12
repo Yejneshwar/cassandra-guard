@@ -103,7 +103,13 @@ function resolveConnection(opts = {}, env = process.env) {
 }
 
 /**
- * Resolve, connect, and return a live client. The caller owns shutdown().
+ * Resolve, connect, and return { client, config }. The caller owns shutdown().
+ *
+ * The config comes back because callers need to report what they connected to,
+ * and the resolved values are no longer visible in the commander opts once they
+ * may have come from the environment. The password is deliberately NOT included:
+ * nothing downstream needs it after the client exists, and omitting it means a
+ * caller that logs the config cannot leak it.
  */
 async function connect(opts, env = process.env) {
   const cfg = resolveConnection(opts, env);
@@ -119,7 +125,15 @@ async function connect(opts, env = process.env) {
   });
 
   await client.connect();
-  return client;
+  return {
+    client,
+    config: {
+      host: cfg.host,
+      port: cfg.port,
+      datacenter: cfg.datacenter,
+      user: cfg.user,
+    },
+  };
 }
 
 module.exports = {

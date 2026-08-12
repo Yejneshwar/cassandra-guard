@@ -159,9 +159,11 @@ addConnectionOptions(
   .option('-o, --output <file>', 'Write migration to file')
   .action(async (schemaFile, opts) => {
     let client;
+    let connection;
     try {
       try {
-        client = await connect(opts);
+        connection = await connect(opts);
+        client = connection.client;
       } catch (e) {
         if (e instanceof ConnectionError) {
           console.error(`Configuration error: ${e.message}`);
@@ -182,7 +184,10 @@ addConnectionOptions(
       const result = differ.diff(liveSchema, newSchema);
 
       let output = `-- Diff: live cluster → ${schemaFile}\n`;
-      output += `-- Cluster: ${opts.host}:${opts.port}\n\n`;
+      // From the resolved config, not from opts: once a value may have come from
+      // the environment, opts.host/opts.port are undefined and this printed
+      // "undefined:undefined".
+      output += `-- Cluster: ${connection.config.host}:${connection.config.port}\n\n`;
 
       if (result.warnings.length > 0) {
         output += '-- WARNINGS:\n';
@@ -226,9 +231,11 @@ addConnectionOptions(
 )
   .action(async (schemaFile, opts) => {
     let client;
+    let connection;
     try {
       try {
-        client = await connect(opts);
+        connection = await connect(opts);
+        client = connection.client;
       } catch (e) {
         // A misconfiguration and a genuinely unreachable cluster need different
         // responses, so do not report them the same way.
