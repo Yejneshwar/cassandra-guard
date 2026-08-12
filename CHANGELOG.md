@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.0.1](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v3.0.0...cassandra-guard-v3.0.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* add auth to client connections ([926c18e](https://github.com/Yejneshwar/cassandra-guard/commit/926c18eaf2fc2b73d8f5d7207cb65a6870b7b942))
+* nested-UDT frozen-ness is representation, not schema — normalize it in compatibility checks ([d65ac5b](https://github.com/Yejneshwar/cassandra-guard/commit/d65ac5b37bcf9bf2c3dbbc9a53bee06b4e976023))
+
 ## [3.0.0](https://github.com/Yejneshwar/cassandra-guard/compare/cassandra-guard-v2.3.0...cassandra-guard-v3.0.0) (2026-07-27)
 
 
